@@ -134,16 +134,20 @@ def copy_initialization(root, run):
     with (folder / 'initialization_source.json').open('w') as f:
         json.dump({'source_experiment': source, 'destination_experiment': name, 'epochs': run['epochs']}, f, indent = 2)
 
+def conda_hook(env):
+    return Path(env.get('CONDA_BASE', '/data/aia/scratch/vsub851/anaconda3')).expanduser() / 'etc' / 'profile.d' / 'conda.sh'
+
 def execution_command(run, env):
     current = env_int(env, 'USE_CURRENT_ENV', 0)
     if current not in [0, 1]:
         raise ValueError('Use USE_CURRENT_ENV=0 or USE_CURRENT_ENV=1')
+    program = ['run_prior.py'] + run['argv']
     if current:
-        prefix = [sys.executable, '-u']
-    else:
-        conda = Path(env.get('CONDA_BASE', '/data/aia/scratch/vsub851/anaconda3')).expanduser() / 'bin' / 'conda'
-        prefix = [str(conda), 'run', '--no-capture-output', '-n', env.get('CONDA_ENV', 'nas'), 'python', '-u']
-    return ['srun', '--unbuffered'] + prefix + ['run_prior.py'] + run['argv']
+        return ['srun', '--unbuffered', sys.executable, '-u'] + program
+    shell = '\n'.join(['source ' + shlex.quote(str(conda_hook(env))),
+                       'conda activate ' + shlex.quote(env.get('CONDA_ENV', 'nas')),
+                       'exec ' + shlex.join(['python', '-u'] + program)])
+    return ['srun', '--unbuffered', 'bash', '-e', '-c', shell]
 
 def execute(root, run, env):
     status = preflight(root, run)
@@ -160,8 +164,8 @@ def execute(root, run, env):
         return
     if not env.get('SLURM_JOB_ID') or not shutil.which('srun'):
         raise RuntimeError('Submit the sbatch script, or set DRY_RUN=1 for a local preflight')
-    if env.get('USE_CURRENT_ENV', '0') != '1' and not Path(command[2]).is_file():
-        raise FileNotFoundError('Conda executable not found. Set CONDA_BASE or activate the environment and export USE_CURRENT_ENV=1')
+    if env.get('USE_CURRENT_ENV', '0') != '1' and not conda_hook(env).is_file():
+        raise FileNotFoundError('Conda shell hook not found. Set CONDA_BASE or activate the environment and export USE_CURRENT_ENV=1')
     locks = root / 'logs' / 'array_locks'
     locks.mkdir(parents = True, exist_ok = True)
     with (locks / f'{name}.lock').open('a') as lock:
