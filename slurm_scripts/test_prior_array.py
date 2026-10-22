@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -64,7 +65,7 @@ class ArrayTests(unittest.TestCase):
                                ('resnet', 'CKA', 'rn50', None, 'train'), ('vit', 'CKA', 'vit_tiny', 12, 'train'),
                                ('resnet', 'KNN', 'rn50', None, 'train'), ('vit', 'KNN', 'vit_tiny', 12, 'train')])
     def test_c_mapping_and_unique_names(self):
-        runs = [make_run(group, i, self.env) for group in RUNS for i in range(len(RUNS[group]))]
+        runs = [make_run(group, i, self.env) for group in ['B', 'C'] for i in range(len(RUNS[group]))]
         self.assertEqual(len(set(run['name'] for run in runs)), 18)
         for run in runs[6:]:
             self.assertEqual(run['phase'], 'full')
@@ -72,7 +73,7 @@ class ArrayTests(unittest.TestCase):
             if run['training']['model'] == 'vit_tiny':
                 self.assertIn(run['training']['teacher_depth'], [8, 24])
     def test_unchanged_default_recipe(self):
-        for group in RUNS:
+        for group in ['B', 'C']:
             for index in range(len(RUNS[group])):
                 run = make_run(group, index, self.env)
                 args = run['training']
@@ -94,7 +95,7 @@ class ArrayTests(unittest.TestCase):
                 self.assertFalse(args['pretrained'])
                 self.assertFalse(args['use_amp'])
     def test_short_budget_names_and_pairs(self):
-        for group in RUNS:
+        for group in ['B', 'C']:
             for index in range(len(RUNS[group])):
                 run = make_run(group, index, dict(self.env, VIT_EPOCHS = '100'))
                 self.assertEqual(run['epochs'], 100)
@@ -107,7 +108,7 @@ class ArrayTests(unittest.TestCase):
         self.assertTrue(run['training']['use_amp'])
         self.assertEqual(run['training']['num_workers'], 6)
     def test_valid_preflight(self):
-        for group in RUNS:
+        for group in ['B', 'C']:
             for index in range(len(RUNS[group])):
                 run = make_run(group, index, self.env)
                 if run['phase'] == 'train':
@@ -191,7 +192,7 @@ class ArrayTests(unittest.TestCase):
         process.assert_not_called()
         self.assertEqual(before, sorted(str(path) for path in self.root.rglob('*')))
     def test_execution_and_completion_all_eighteen(self):
-        for group in RUNS:
+        for group in ['B', 'C']:
             for index in range(len(RUNS[group])):
                 run = make_run(group, index, self.env)
                 if run['phase'] == 'train':
@@ -245,8 +246,96 @@ class ArrayTests(unittest.TestCase):
     def test_conda_command(self):
         run = make_run('B', 0, self.env)
         command = execution_command(run, dict(self.env, USE_CURRENT_ENV = '0'))
-        self.assertEqual(command[:9], ['srun', '--unbuffered', '/data/aia/scratch/vsub851/anaconda3/bin/conda',
-                                     'run', '--no-capture-output', '-n', 'nas', 'python', '-u'])
+        self.assertEqual(command[:5], ['srun', '--unbuffered', 'bash', '-e', '-c'])
+        lines = command[5].splitlines()
+        self.assertEqual(shlex.split(lines[0]), ['source', '/data/aia/scratch/vsub851/anaconda3/etc/profile.d/conda.sh'])
+        self.assertEqual(shlex.split(lines[1]), ['conda', 'activate', 'nas'])
+        self.assertEqual(shlex.split(lines[2]), ['exec', 'python', '-u', 'run_prior.py'] + run['argv'])
+        self.assertNotIn('--no-capture-output', command[5])
+    def test_current_environment_bypasses_conda(self):
+        run = make_run('B', 5, self.env)
+        self.assertEqual(execution_command(run, self.env), ['srun', '--unbuffered', sys.executable, '-u', 'run_prior.py'] + run['argv'])
+    def test_default_activation_and_quoting(self):
+        base = self.root / 'fake conda'
+        hook = base / 'etc' / 'profile.d' / 'conda.sh'
+        hook.parent.mkdir(parents = True)
+        bin_dir = self.root / 'activated env' / 'bin'
+        bin_dir.mkdir(parents = True)
+        (bin_dir / 'python').symlink_to(sys.executable)
+        hook.write_text('conda() {\n    export PATH=' + shlex.quote(str(bin_dir)) + ':${PATH}\n    export PRIOR_TEST_ACTIVATED=1\n}\n')
+        program = '\n'.join(['import json', 'import os', 'import sys', 'from pathlib import Path',
+                             'Path(\'called.json\').write_text(json.dumps({\'argv\': sys.argv[1:], \'python\': sys.executable, \'activated\': os.environ.get(\'PRIOR_TEST_ACTIVATED\')}))'])
+        (self.root / 'run_prior.py').write_text(program)
+        env = dict(os.environ, **self.env, CONDA_BASE = str(base), CONDA_ENV = 'nas; exit 79')
+        env['USE_CURRENT_ENV'] = '0'
+        env.pop('PRIOR_TEST_ACTIVATED', None)
+        for group in ['B', 'C']:
+            for index in range(len(RUNS[group])):
+                run = make_run(group, index, env)
+                run['argv'][-1] += '; touch should_not_exist'
+                command = execution_command(run, env)
+                self.assertEqual(shlex.split(command[5].splitlines()[1]), ['conda', 'activate', env['CONDA_ENV']])
+                result = subprocess.run(command[2:], cwd = self.root, env = env, capture_output = True, text = True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                called = read_json(self.root / 'called.json')
+                self.assertEqual(called['argv'], run['argv'])
+                self.assertEqual(called['python'], str(bin_dir / 'python'))
+                self.assertEqual(called['activated'], '1')
+                self.assertFalse((self.root / 'should_not_exist').exists())
+    def test_activation_failure_does_not_start_python(self):
+        base = self.root / 'failed conda'
+        hook = base / 'etc' / 'profile.d' / 'conda.sh'
+        hook.parent.mkdir(parents = True)
+        hook.write_text('conda() { return 23; }\n')
+        (self.root / 'run_prior.py').write_text('from pathlib import Path\nPath(\'called\').touch()\n')
+        env = dict(self.env, USE_CURRENT_ENV = '0', CONDA_BASE = str(base))
+        command = execution_command(make_run('B', 0, env), env)
+        result = subprocess.run(command[2:], cwd = self.root, capture_output = True, text = True)
+        self.assertEqual(result.returncode, 23)
+        self.assertFalse((self.root / 'called').exists())
+    def test_missing_hook_fails_before_writes(self):
+        env = dict(self.env, USE_CURRENT_ENV = '0', CONDA_BASE = str(self.root / 'missing conda'))
+        run = make_run('B', 0, env)
+        with patch('shutil.which', return_value = '/mock/srun'), patch('subprocess.run') as process:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(FileNotFoundError, 'shell hook'):
+                execute(self.root, run, env)
+        process.assert_not_called()
+        self.assertFalse((self.root / 'logs').exists())
+        self.assertFalse((self.root / 'saved_models').exists())
+    def test_legacy_failed_launch_log_allows_training_retry(self):
+        run = make_run('B', 5, self.env)
+        write_initialization(self.root, run)
+        checkpoint = self.root / 'saved_models' / ('orig_' + run['name'] + '.pt')
+        original = checkpoint.read_bytes()
+        folder = self.root / 'logs' / run['name']
+        write_json(folder / 'slurm_launch_12344.json', {'command': ['srun', 'conda', 'run', '--no-capture-output']})
+        self.assertEqual(preflight(self.root, run), 'train')
+        with patch('shutil.which', return_value = '/mock/srun'), patch('subprocess.run', side_effect = subprocess.CalledProcessError(2, ['srun'])):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(subprocess.CalledProcessError):
+                execute(self.root, run, self.env)
+        self.assertEqual(checkpoint.read_bytes(), original)
+        self.assertEqual(preflight(self.root, run), 'train')
+        with patch('shutil.which', return_value = '/mock/srun'), patch('subprocess.run', side_effect = lambda *args, **kwargs: write_completion(self.root, run)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                execute(self.root, run, self.env)
+        self.assertEqual(preflight(self.root, run), 'complete')
+        self.assertEqual(checkpoint.read_bytes(), original)
+    def test_activation_failure_allows_default_path_retry(self):
+        base = self.root / 'retry conda'
+        hook = base / 'etc' / 'profile.d' / 'conda.sh'
+        hook.parent.mkdir(parents = True)
+        hook.write_text('conda() { return 23; }\n')
+        env = dict(self.env, USE_CURRENT_ENV = '0', CONDA_BASE = str(base))
+        run = make_run('B', 5, env)
+        write_initialization(self.root, run)
+        process_run = subprocess.run
+        def launch(command, cwd, env, check):
+            return process_run(command[2:], cwd = cwd, env = env, check = check)
+        with patch('shutil.which', return_value = '/mock/srun'), patch('subprocess.run', side_effect = launch):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(subprocess.CalledProcessError):
+                execute(self.root, run, env)
+        self.assertEqual(preflight(self.root, run), 'train')
+        self.assertFalse((self.root / 'logs' / run['name'] / 'training_args.json').exists())
     def test_invalid_inputs(self):
         for env in [dict(self.env, SEED = '-1'), dict(self.env, AMP = '2'), dict(self.env, VIT_EPOCHS = '20'), dict(self.env, DATA_DIR = '')]:
             with self.assertRaises(ValueError):

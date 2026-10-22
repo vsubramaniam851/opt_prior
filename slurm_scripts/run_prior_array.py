@@ -21,7 +21,11 @@ RUNS = {
           ('resnet', 'KNN', 'rn101', None), ('resnet', 'KNN', 'rn152', None),
           ('vit', 'KNN', 'vit_tiny', 8), ('vit', 'KNN', 'vit_tiny', 24),
           ('vit', 'CKA', 'vit_base', None), ('vit', 'CKA', 'vit_large', None),
-          ('vit', 'KNN', 'vit_base', None), ('vit', 'KNN', 'vit_large', None)]
+          ('vit', 'KNN', 'vit_base', None), ('vit', 'KNN', 'vit_large', None)],
+    'D': [('resnet', 'CKA', 'rn50', None), ('resnet', 'KNN', 'rn50', None),
+          ('vit', 'CKA', 'vit_tiny', 12), ('vit', 'KNN', 'vit_tiny', 12),
+          ('resnet', 'CKA', 'rn152', None), ('resnet', 'KNN', 'rn152', None),
+          ('vit', 'CKA', 'vit_tiny', 24), ('vit', 'KNN', 'vit_tiny', 24)]
 }
 TRAINING_KEYS = ['seed', 'ft_epochs', 'ft_batch', 'ft_accum', 'ft_optimizer', 'ft_lr', 'ft_wd', 'ft_clip',
                  'label_smoothing', 'mixup_alpha', 'scheduler', 'scheduler_type', 'warmup_epochs', 'use_amp']
@@ -42,16 +46,22 @@ def env_int(env, name, default, minimum = 0):
 
 def make_run(group, index, env):
     if group not in RUNS or index < 0 or index >= len(RUNS[group]):
-        raise ValueError('Use group B with indices 0-5 or group C with indices 0-11; C indices 8-11 are optional wider guides')
+        raise ValueError('Use group B with indices 0-5 or group C with indices 0-11 or group D with indices 0-7')
     if not env.get('DATA_DIR'):
         raise ValueError('Set DATA_DIR to the ImageNet directory containing train and val')
     family, method, guide, depth = RUNS[group][index]
     default_epochs = 100 if family == 'resnet' else 300
     epochs = env_int(env, 'RESNET_EPOCHS' if family == 'resnet' else 'VIT_EPOCHS', default_epochs, 6 if family == 'resnet' else 21)
     phase = 'train' if group == 'B' and method != 'baseline' else 'full'
+    if group == 'D':
+        phase = env.get('PRIOR_PHASE', 'align')
+        if phase not in ['align', 'train', 'full']:
+            raise ValueError('PRIOR_PHASE must be align, train or full')
     argv = [family, method, '--guide', guide, '--data_dir', str(Path(env['DATA_DIR']).expanduser().resolve()),
             '--seed', str(env_int(env, 'SEED', 0)), '--teacher_seed', str(env_int(env, 'TEACHER_SEED', 1000)),
             '--workers', str(env_int(env, 'WORKERS', 8)), '--phase', phase, '--epochs', str(epochs)]
+    if group == 'D':
+        argv += ['--prior_descriptor', 'spatial']
     if depth is not None:
         argv += ['--depth', str(depth)]
     amp = env_int(env, 'AMP', 0)
@@ -95,6 +105,9 @@ def preflight(root, run):
         raise FileNotFoundError(f'Expected ImageNet class directories under {data}/train and {data}/val')
     name = run['name']
     folder = root / 'logs' / name
+    if run['phase'] == 'align' and (folder / 'prior_alignment.json').is_file():
+        validate_initialization(root, name, run)
+        return 'complete_alignment'
     final = root / 'saved_models' / f'ft_final_{name}.pt'
     result = folder / ('ft_results_seed' + str(run['training']['seed']) + '.json')
     if final.is_file() and result.is_file():
@@ -141,7 +154,7 @@ def execution_command(run, env):
     current = env_int(env, 'USE_CURRENT_ENV', 0)
     if current not in [0, 1]:
         raise ValueError('Use USE_CURRENT_ENV=0 or USE_CURRENT_ENV=1')
-    program = ['run_prior.py'] + run['argv']
+    program = [run.get('program', 'run_prior.py')] + run['argv']
     if current:
         return ['srun', '--unbuffered', sys.executable, '-u'] + program
     shell = '\n'.join(['source ' + shlex.quote(str(conda_hook(env))),
@@ -156,7 +169,7 @@ def execute(root, run, env):
     group, index, epochs = run['group'], run['index'], run['epochs']
     print(f'Array {group}[{index}]: {name}, epochs={epochs}, action={status}', flush = True)
     print(shlex.join(command), flush = True)
-    if status == 'complete':
+    if status in ['complete', 'complete_alignment']:
         print('Already complete; skipping without changing results', flush = True)
         return
     if env.get('DRY_RUN', '0') == '1':
@@ -174,7 +187,7 @@ def execute(root, run, env):
         except BlockingIOError:
             raise RuntimeError(f'Another batch launcher holds the lock for {name}')
         status = preflight(root, run)
-        if status == 'complete':
+        if status in ['complete', 'complete_alignment']:
             return
         if status == 'copy':
             copy_initialization(root, run)
@@ -192,13 +205,14 @@ def execute(root, run, env):
             json.dump(launch, f, indent = 2)
         print('WANDB_MODE=' + child_env['WANDB_MODE'], flush = True)
         subprocess.run(command, cwd = root, env = child_env, check = True)
-        if preflight(root, run) != 'complete':
+        expected = 'complete_alignment' if run['phase'] == 'align' else 'complete'
+        if preflight(root, run) != expected:
             raise RuntimeError('The process exited without a complete final checkpoint and result JSON')
         print(f'Completed: {name}', flush = True)
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in RUNS:
-        raise ValueError('Run from network_theseus: python3 -m slurm_scripts.run_prior_array B or C')
+        raise ValueError('Run from network_theseus: python3 -m slurm_scripts.run_prior_array B, C or D')
     env = dict(os.environ)
     index = env_int(env, 'SLURM_ARRAY_TASK_ID', -1)
     run = make_run(sys.argv[1], index, env)
