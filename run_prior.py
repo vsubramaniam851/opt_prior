@@ -24,6 +24,7 @@ def get_run_args():
     parser.add_argument('--prior_schedule', choices = ['cumulative', 'frozen'], default = 'cumulative')
     parser.add_argument('--prior_min_rank_ratio', type = float, default = 0.0)
     parser.add_argument('--prior_norm', choices = ['batch', 'eval'], default = 'batch')
+    parser.add_argument('--prior_descriptor', choices = ['pooled', 'spatial'], default = 'pooled')
     parser.add_argument('--epochs', type = int, default = None)
     parser.add_argument('--workers', type = int, default = 8)
     parser.add_argument('--exp_name', default = None)
@@ -57,6 +58,8 @@ def build_command(args):
         name = f'prior_v2_{student}_baseline_s{args.seed}'
     if args.amp:
         name += '_bf16'
+    if args.prior_descriptor != 'pooled' and args.method != 'baseline':
+        name += '_spatial'
     name = args.exp_name or name
     method = 'CKA' if args.method == 'baseline' else args.method
     epochs = args.epochs if args.epochs is not None else (100 if resnet else 300)
@@ -76,6 +79,8 @@ def build_command(args):
                '--ft_epochs', str(epochs), '--label_smoothing', '0.1', '--mixup_alpha', '0' if resnet else '0.8',
                '--ft_clip', '0' if resnet else '1', '--scheduler', '--scheduler_type', 'cosine',
                '--warmup_epochs', '5' if resnet else '20']
+    if args.prior_descriptor != 'pooled':
+        command += ['--prior_descriptor', args.prior_descriptor]
     if not resnet:
         command += ['--student_vit', 'vit_tiny']
     if depth is not None:

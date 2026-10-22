@@ -40,6 +40,8 @@ def validate_prior_args(args):
         raise ValueError('Use full downstream training and select alignment normalization with --prior_norm')
     if args.reload_progressive or args.continue_ft or args.bit8_adam or args.measure_alignment:
         raise ValueError('This preset supports --reload_ft, but not legacy continuation or alignment diagnostics')
+    if getattr(args, 'prior_descriptor', 'pooled') not in ['pooled', 'spatial']:
+        raise ValueError('prior_descriptor must be pooled or spatial')
     if args.prior_schedule not in ['cumulative', 'frozen']:
         raise ValueError('prior_schedule must be cumulative or frozen')
     if args.repdist not in ['CKA', 'UCKA', 'KNN']:
@@ -76,6 +78,8 @@ def prior_config(args):
     config = {name: getattr(args, name, None) for name in names}
     if config['data_dir'] is not None:
         config['data_dir'] = os.path.realpath(os.path.expanduser(config['data_dir']))
+    if getattr(args, 'prior_descriptor', 'pooled') != 'pooled':
+        config['prior_descriptor'] = args.prior_descriptor
     return config
 
 def check_prior_run(args):
@@ -95,7 +99,8 @@ def check_prior_run(args):
     if metadata.get('version') != 2 or not metadata.get('complete'):
         raise ValueError('The initialization is not a completed version 2 run')
     config = prior_config(args)
-    mismatched = [name for name, value in config.items() if metadata['alignment_config'].get(name) != value]
+    mismatched = [name for name in sorted(set(config) | set(metadata['alignment_config']))
+                  if metadata['alignment_config'].get(name) != config.get(name)]
     if mismatched:
         raise ValueError(f'Alignment configuration differs from the checkpoint: {mismatched}')
     if os.path.exists(f'saved_models/ft_final_{args.exp_name}.pt'):
@@ -184,7 +189,7 @@ def prior_endpoints(teacher, student, index, schedule):
     targets = [math.ceil((i + 1) * len(teacher_blocks) / len(blocks)) - 1 for i in indices]
     return indices, targets
 
-def prior_forward(model, images, indices, pool_hw = None):
+def prior_forward(model, images, indices, pool_hw = None, descriptor = 'pooled'):
     single = isinstance(indices, int)
     indices = [indices] if single else list(indices)
     _, blocks, _ = prior_parts(model)
@@ -201,11 +206,15 @@ def prior_forward(model, images, indices, pool_hw = None):
     for index, block in enumerate(blocks[:indices[-1] + 1]):
         x = block(x)
         if index in indices:
-            outputs.append(prior_features(x, pool_hw) if pool_hw is not None else x)
+            outputs.append(prior_features(x, pool_hw, descriptor) if pool_hw is not None else x)
     return outputs[0] if single else outputs
 
-def prior_features(z, pool_hw = 4):
-    z = z.float()
+def prior_features(z, pool_hw = 4, descriptor = 'pooled'):
+    z = z if z.dtype == torch.float64 else z.float()
+    if descriptor == 'spatial':
+        return prior_spatial_features(z, pool_hw)
+    if descriptor != 'pooled':
+        raise ValueError('Unknown representation descriptor')
     if z.dim() == 4:
         width = min(pool_hw, z.size(-2), z.size(-1)) if pool_hw > 0 else min(4, z.size(-2), z.size(-1))
         spatial = F.adaptive_avg_pool2d(z, width).flatten(1)
@@ -213,6 +222,26 @@ def prior_features(z, pool_hw = 4):
     if z.dim() == 3:
         return [z[:, 0], z[:, 1:].mean(dim = 1)]
     return [z.flatten(1)]
+
+def prior_spatial_features(z, pool_hw = 4):
+    if z.dim() == 4:
+        grid = z
+        global_features = z.mean(dim = (2, 3))
+    elif z.dim() == 3:
+        side = math.isqrt(z.size(1) - 1)
+        if side * side != z.size(1) - 1 or side < 2:
+            raise ValueError('Spatial ViT alignment requires a square grid of patch tokens')
+        grid = z[:, 1:].transpose(1, 2).reshape(z.size(0), z.size(2), side, side)
+        global_features = z[:, 0]
+    else:
+        raise ValueError('Spatial alignment requires feature maps or ViT patch tokens')
+    width = min(pool_hw if pool_hw > 0 else 4, grid.size(-2), grid.size(-1))
+    if width < 2:
+        raise ValueError('Spatial alignment requires at least a 2 by 2 feature grid')
+    grid = F.adaptive_avg_pool2d(grid, width)
+    residual = (grid - grid.mean(dim = (2, 3), keepdim = True)).flatten(1)
+    residual = F.normalize(residual, dim = 1, eps = 1e-8)
+    return [residual, global_features]
 
 def prior_metric(features, targets, args):
     if args.repdist == 'KNN':
@@ -276,8 +305,8 @@ def prior_log(values):
 def prior_batch(args, teacher, student, images, student_indices, teacher_indices):
     with torch.autocast(device_type = images.device.type, dtype = torch.bfloat16, enabled = args.use_amp and images.device.type == 'cuda'):
         with torch.no_grad():
-            targets = prior_forward(teacher, images, teacher_indices, args.pool_hw)
-        features = prior_forward(student, images, student_indices, args.pool_hw)
+            targets = prior_forward(teacher, images, teacher_indices, args.pool_hw, getattr(args, 'prior_descriptor', 'pooled'))
+        features = prior_forward(student, images, student_indices, args.pool_hw, getattr(args, 'prior_descriptor', 'pooled'))
     losses = [prior_metric(x, y, args) for x, y in zip(features, targets)]
     return torch.stack(losses).mean(), losses, features, targets
 

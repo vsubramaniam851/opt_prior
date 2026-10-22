@@ -147,6 +147,7 @@ def get_args():
     parser.add_argument('--rep_val_size', type = int, default = 4096)
     parser.add_argument('--rep_split_seed', type = int, default = 0)
     parser.add_argument('--prior_norm', choices = ['batch', 'eval'], default = 'batch')
+    parser.add_argument('--prior_descriptor', choices = ['pooled', 'spatial'], default = 'pooled')
     parser.add_argument('--prior_schedule', choices = ['cumulative', 'frozen'], default = 'cumulative')
     parser.add_argument('--prior_min_rank_ratio', type = float, default = 0.0)
     parser.set_defaults(low_rank = True, tune_linear = False, reload_cka = False, reload_ft = False, scheduler = False, pretrained = True, 

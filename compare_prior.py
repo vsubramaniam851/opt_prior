@@ -29,10 +29,11 @@ TRAINING_KEYS = ['setting', 'imagenet', 'data_dir', 'ft_epochs', 'ft_batch', 'ft
 ALIGNMENT_KEYS = ['repdist', 'cka_loss', 'knn_loss', 'knn_k', 'knn_temp', 'rep_batch', 'rep_val_size',
                   'rep_split_seed', 'rep_val_interval', 'max_stage_steps', 'progressive_lrs', 'progressive_epochs',
                   'rep_wd', 'rep_scheduler', 'pool_hw', 'prior_schedule', 'align_mix', 'prior_min_rank_ratio',
-                  'prior_norm', 'anchor_to_init', 'anchor_lambda']
+                  'prior_norm', 'prior_descriptor', 'anchor_to_init', 'anchor_lambda']
 METRICS = ['loss', 'cka', 'ucka', 'knn_overlap', 'student_rank', 'teacher_rank', 'student_centered_rms', 'teacher_centered_rms']
 SOURCE_FILES = ['args.py', 'run_prior.py', 'theseus.py', 'prior_utils.py', 'rep_sims.py', 'finetune.py',
-                'dataloader.py', 'vits.py', 'slurm_scripts/run_prior_array.py', 'compare_prior.py']
+                'dataloader.py', 'vits.py', 'slurm_scripts/run_prior_array.py', 'compare_prior.py',
+                'audit_prior_geometry.py', 'restart_prior_baseline.py']
 VITS = {'vit_tiny': (192, 4), 'vit_small': (384, 8), 'vit_base': (768, 12), 'vit_large': (1024, 24)}
 SECRET_KEYS = {'api_key', 'wandb_api_key', 'hf_token', 'access_token', 'auth_token', 'password', 'secret', 'token'}
 
@@ -241,6 +242,7 @@ def load_run(root, folder):
     run['recipe'] = recipe
     run['recipe_id'] = digest(clean(recipe))
     controls = {key: alignment.get(key, config.get(key)) for key in ALIGNMENT_KEYS}
+    controls['prior_descriptor'] = alignment.get('prior_descriptor', config.get('prior_descriptor', 'pooled'))
     controls['validation_indices_hash'] = digest(meta['validation_indices']) if isinstance(meta.get('validation_indices'), list) else None
     run['alignment_controls'] = controls
     run['alignment_id'] = digest(clean(controls))
@@ -365,8 +367,8 @@ def condition_summary(runs):
 def depth_comparisons(runs):
     groups = defaultdict(list)
     for run in runs:
-        if run['pair_status'] == 'matched' and run['guide_series'] and run['guide_depth']:
-            key = (run['recipe_id'], run['alignment_id'], run['guide_series'], run['seed'], run['guide_seed'], run['paired_baseline'])
+        if run['eligible'] and run['method'] != 'baseline' and run['guide_series'] and run['guide_depth']:
+            key = (run['recipe_id'], run['alignment_id'], run['guide_series'], run['seed'], run['guide_seed'], run['metadata']['student_initial_hash'])
             groups[key].append(run)
     rows = []
     for entries in groups.values():
@@ -395,7 +397,7 @@ def slurm_observations(root, runs):
             with source.open(errors = 'replace') as handle:
                 for line in handle:
                     line = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line)
-                    match = re.search(r'Array [BC]\[\d+\]: (.*?), epochs=', line)
+                    match = re.search(r'Array [BCD]\[\d+\]: (.*?), epochs=', line)
                     if match:
                         name = match.group(1)
                     for match in pattern.finditer(line):
@@ -405,7 +407,7 @@ def slurm_observations(root, runs):
                                 points.append(point)
                         except ValueError:
                             pass
-                    if re.search(r'(?i)(Traceback|Error:|error:|out of memory|DUE TO TIME LIMIT|non-zero exit status)', line):
+                    if re.search(r'(?i)(Traceback|Error:|\[ERROR\]|out of memory|DUE TO TIME LIMIT|non-zero exit status)', line):
                         errors.append(text_redact(line.strip()[-1500:]))
                     for part in line.split('\r'):
                         if part.strip():
@@ -625,7 +627,7 @@ def report_text(runs, inventory, summary, depths, issues, plot_paths):
                                       ('guide_seed', 'Guide seed'), ('epochs', 'Epochs'), ('n_student_seeds', 'Student seeds'),
                                       ('mean_delta_pp', 'Mean gain (pp)'), ('sd_delta_pp', 'SD (pp)'), ('condition_id', 'Condition')]) if summary else 'No valid matched comparisons yet.', '',
               '## Depth contrasts', '', 'These contrasts compare adjacent available depths within the same guide architecture series, '
-              'student seed, guide seed, alignment settings, and downstream recipe. ViT widths and ResNet basic/bottleneck series are kept separate. '
+              'student seed and initial-state hash, guide seed, alignment settings, and downstream recipe. These direct guide-depth contrasts do not require a completed baseline. ViT widths and ResNet basic/bottleneck series are kept separate. '
               'No monotonicity or positive effect is assumed.', '']
     lines += [markdown_table(depths, [('method', 'Method'), ('guide_series', 'Series'), ('seed', 'Student seed'), ('guide_seed', 'Guide seed'),
                                      ('shallower_depth', 'Shallower'), ('deeper_depth', 'Deeper'), ('deeper_minus_shallower_pp', 'Deeper − shallower (pp)')]) if depths else 'No comparable depth pairs yet.', '',
@@ -645,7 +647,7 @@ def report_text(runs, inventory, summary, depths, issues, plot_paths):
               '## Figures', '', str(len(plot_paths)) + ' PNG figures written under plots/. No model weights are loaded.', '']
     return '\n'.join(lines)
 
-def bundle_results(root, output, runs, artifacts, observations, include_code):
+def bundle_results(root, output, runs, artifacts, observations, include_code, include_geometry = False):
     target = output / 'prior_results_bundle.zip'
     packages = {}
     for name in ['torch', 'torchvision', 'numpy', 'matplotlib', 'nvidia-dali-cuda120', 'nvidia-dali-cuda110']:
@@ -678,6 +680,15 @@ def bundle_results(root, output, runs, artifacts, observations, include_code):
                 manifest['files'].append({'path': name, 'sha256': file_hash(path), 'included': include_code})
                 if include_code:
                     archive.writestr('code/' + name, text_redact(path.read_text()))
+        if include_geometry:
+            for run in runs:
+                path = root / 'geometry_audit' / (run['experiment'] + '.json')
+                if path.is_file():
+                    geometry = read_json(path)
+                    if geometry.get('experiment') != run['experiment']:
+                        raise ValueError('Geometry audit experiment mismatch: ' + str(path))
+                    archive.writestr('geometry_audit/' + path.name, json.dumps(clean(geometry), indent = 2, allow_nan = False))
+                    manifest['files'].append({'path': str(path.relative_to(root)), 'original_sha256': file_hash(path)})
         archive.writestr('manifest.json', json.dumps(clean(manifest), indent = 2, allow_nan = False))
         archive.writestr('README.txt', 'Upload this archive for analysis. No checkpoints, dataset images, environment variables, or W&B directories are included.\n'
                          'All validation curves and available alignment/argument metadata are included. Batchwise loss/norm arrays are summarized.\n'
@@ -737,7 +748,7 @@ def analyze(args):
     artifact_list = output / 'generated_files.json'
     write_json(artifact_list, {'files': [str(path.relative_to(output)) for path in artifacts]})
     artifacts.append(artifact_list)
-    bundle = bundle_results(root, output, runs, artifacts, observations, args.include_code) if args.bundle else None
+    bundle = bundle_results(root, output, runs, artifacts, observations, args.include_code, getattr(args, 'include_geometry', False)) if args.bundle else None
     print(markdown_table(inventory, [('experiment', 'Experiment'), ('status', 'State'), ('final_top1', 'Final top-1'),
                                      ('delta_pp', 'Gain (pp)'), ('pair_status', 'Pairing')]))
     print('\nReport: ' + str(report))
@@ -755,6 +766,7 @@ def get_args(argv = None):
     parser.add_argument('--include_slurm', action = 'store_true')
     parser.add_argument('--bundle', action = 'store_true')
     parser.add_argument('--include_code', action = 'store_true')
+    parser.add_argument('--include_geometry', action = 'store_true')
     return parser.parse_args(argv)
 
 if __name__ == '__main__':

@@ -13,6 +13,7 @@ def get_diagnostic_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--family', choices = ['resnet', 'vit', 'all'], default = 'all')
     parser.add_argument('--device', choices = ['cpu', 'cuda'], default = 'cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--prior_descriptor', choices = ['pooled', 'spatial'], default = 'pooled')
     parser.add_argument('--batch', type = int, default = 8)
     parser.add_argument('--threads', type = int, default = 2)
     parser.add_argument('--output', default = 'prior_shape_diagnostics.json')
@@ -34,7 +35,8 @@ def diagnose(args):
     generator = torch.Generator().manual_seed(91)
     images = torch.randn(args.batch, 3, 224, 224, generator = generator).to(device)
     config = SimpleNamespace(use_amp = False, pool_hw = 4, repdist = 'CKA', cka_loss = 'debiased', knn_k = 3, knn_temp = 0.2)
-    report = {'torch': torch.__version__, 'torchvision': torchvision.__version__, 'device': str(device),
+    config.prior_descriptor = args.prior_descriptor
+    report = {'prior_descriptor': args.prior_descriptor, 'torch': torch.__version__, 'torchvision': torchvision.__version__, 'device': str(device),
               'images': 'synthetic Gaussian tensors, not ImageNet', 'shape': list(images.shape),
               'normalization': 'batch statistics without running-statistic updates', 'knn_k': 3, 'knn_temperature': 0.2,
               'tests': [], 'complete': False}
