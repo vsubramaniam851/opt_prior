@@ -29,11 +29,12 @@ TRAINING_KEYS = ['setting', 'imagenet', 'data_dir', 'ft_epochs', 'ft_batch', 'ft
 ALIGNMENT_KEYS = ['repdist', 'cka_loss', 'knn_loss', 'knn_k', 'knn_temp', 'rep_batch', 'rep_val_size',
                   'rep_split_seed', 'rep_val_interval', 'max_stage_steps', 'progressive_lrs', 'progressive_epochs',
                   'rep_wd', 'rep_scheduler', 'pool_hw', 'prior_schedule', 'align_mix', 'prior_min_rank_ratio',
-                  'prior_norm', 'prior_descriptor', 'anchor_to_init', 'anchor_lambda']
+                  'prior_norm', 'prior_descriptor', 'prior_start_stage', 'prior_update_scope', 'anchor_to_init', 'anchor_lambda']
 METRICS = ['loss', 'cka', 'ucka', 'knn_overlap', 'student_rank', 'teacher_rank', 'student_centered_rms', 'teacher_centered_rms']
 SOURCE_FILES = ['args.py', 'run_prior.py', 'theseus.py', 'prior_utils.py', 'rep_sims.py', 'finetune.py',
                 'dataloader.py', 'vits.py', 'slurm_scripts/run_prior_array.py', 'compare_prior.py',
-                'audit_prior_geometry.py', 'restart_prior_baseline.py']
+                'audit_prior_geometry.py', 'restart_prior_baseline.py', 'slurm_scripts/run_prior_audit.py',
+                'slurm_scripts/prior_e_upper.sbatch']
 VITS = {'vit_tiny': (192, 4), 'vit_small': (384, 8), 'vit_base': (768, 12), 'vit_large': (1024, 24)}
 SECRET_KEYS = {'api_key', 'wandb_api_key', 'hf_token', 'access_token', 'auth_token', 'password', 'secret', 'token'}
 
@@ -208,6 +209,9 @@ def load_run(root, folder):
         issue(run, 'alignment_no_op', 'The retained initialization has the same recorded state hash as the random student')
     alignment = meta.get('alignment_config', {})
     mismatches = [key for key, value in alignment.items() if key in config and config[key] != value]
+    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix')]:
+        if alignment.get(key, default) != config.get(key, default) and key not in mismatches:
+            mismatches.append(key)
     if not alignment or mismatches:
         issue(run, 'alignment_config_mismatch', 'Missing alignment configuration or differing values: ' + ', '.join(mismatches), True)
     final = result.get('final_top1')
@@ -243,6 +247,8 @@ def load_run(root, folder):
     run['recipe_id'] = digest(clean(recipe))
     controls = {key: alignment.get(key, config.get(key)) for key in ALIGNMENT_KEYS}
     controls['prior_descriptor'] = alignment.get('prior_descriptor', config.get('prior_descriptor', 'pooled'))
+    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix')]:
+        controls[key] = alignment.get(key, config.get(key, default))
     controls['validation_indices_hash'] = digest(meta['validation_indices']) if isinstance(meta.get('validation_indices'), list) else None
     run['alignment_controls'] = controls
     run['alignment_id'] = digest(clean(controls))
@@ -322,6 +328,8 @@ def stage_tables(runs):
             common = {'experiment': run['experiment'], 'method': run['method'], 'stage': stage_name,
                       'student_endpoint': stage.get('student_endpoint'), 'teacher_endpoint': stage.get('teacher_endpoint')}
             row = {**common, 'accepted': stage.get('accepted'), 'steps': stage.get('steps'), 'best_step': stage.get('best_step'),
+                   'prior_start_stage': stage.get('prior_start_stage', 1), 'prior_update_scope': stage.get('prior_update_scope', 'prefix'),
+                   'lower_prefix_unchanged': stage.get('lower_prefix_unchanged'),
                    'align_mix': stage.get('align_mix'), 'rank_gate_enabled': stage.get('rank_gate_enabled'),
                    'relative_parameter_change': stage.get('relative_parameter_change'), 'initial_loss': initial.get('loss'),
                    'selected_loss': final.get('loss'), 'best_unmixed_loss': stage.get('best_unmixed', {}).get('loss'),
@@ -358,6 +366,10 @@ def condition_summary(runs):
         output.append({'condition_id': condition, 'recipe_id': first['recipe_id'], 'student': first['student'],
                        'method': first['method'], 'guide': first['guide'], 'guide_depth': first['guide_depth'],
                        'guide_width': first['guide_width'], 'guide_seed': first['guide_seed'], 'epochs': first['epochs'],
+                       'prior_descriptor': first['alignment_controls']['prior_descriptor'],
+                       'prior_start_stage': first['alignment_controls']['prior_start_stage'],
+                       'prior_update_scope': first['alignment_controls']['prior_update_scope'],
+                       'steps_per_phase': first['alignment_controls']['max_stage_steps'],
                        'alignment_id': first['alignment_id'], 'student_seeds': sorted(run['seed'] for run in entries),
                        'n_student_seeds': len(entries), 'mean_final_top1': average([run['final_top1'] for run in entries]),
                        'mean_delta_pp': average(values), 'sd_delta_pp': statistics.stdev(values) if len(values) > 1 else None,
@@ -397,7 +409,7 @@ def slurm_observations(root, runs):
             with source.open(errors = 'replace') as handle:
                 for line in handle:
                     line = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line)
-                    match = re.search(r'Array [BCD]\[\d+\]: (.*?), epochs=', line)
+                    match = re.search(r'Array [BCDE]\[\d+\]: (.*?), epochs=', line)
                     if match:
                         name = match.group(1)
                     for match in pattern.finditer(line):
@@ -424,7 +436,11 @@ def inventory_row(run, observations):
              'paired_baseline', 'baseline_top1', 'delta_pp']
     row = {name: run.get(name) for name in names}
     meta = run['metadata']
-    row.update({'schedule': meta.get('schedule'), 'align_mix': meta.get('align_mix'),
+    controls = run.get('alignment_controls', meta.get('alignment_config', {}))
+    row.update({'prior_descriptor': controls.get('prior_descriptor', 'pooled'),
+                'prior_start_stage': controls.get('prior_start_stage', 1), 'prior_update_scope': controls.get('prior_update_scope', 'prefix'),
+                'steps_per_phase': controls.get('max_stage_steps'),
+                'schedule': meta.get('schedule'), 'align_mix': meta.get('align_mix'),
                 'rank_gate_enabled': meta.get('rank_gate_enabled'), 'guide_unchanged': meta.get('guide_unchanged'),
                 'initialization_hash': meta.get('student_initial_hash'), 'aligned_hash': meta.get('student_aligned_hash'),
                 'initialization_changed': meta.get('student_aligned_hash') != meta.get('student_initial_hash') if meta.get('student_aligned_hash') else None,
@@ -490,7 +506,12 @@ def short_label(run):
     meta = run['metadata']
     method, seed, guide_seed = run['method'], run['seed'], run['guide_seed']
     schedule, mix = meta.get('schedule'), meta.get('align_mix')
-    return f'{method} / {guide} / s{seed} g{guide_seed} / {schedule} a={mix}'
+    controls = run.get('alignment_controls', meta.get('alignment_config', {}))
+    descriptor = controls.get('prior_descriptor', 'pooled')
+    start = controls.get('prior_start_stage', 1)
+    scope = controls.get('prior_update_scope', 'prefix')
+    steps = controls.get('max_stage_steps')
+    return f'{method} / {guide} / {descriptor} / from{start} {scope} / {steps} steps / s{seed} g{guide_seed} / {schedule} a={mix}'
 
 def figure(title, xlabel, ylabel, size = (9, 5)):
     fig = Figure(figsize = size, dpi = 150)
@@ -624,6 +645,8 @@ def report_text(runs, inventory, summary, depths, issues, plot_paths):
                        ('last_observed_position', 'Last position'), ('observed_axis', 'Axis'), ('last_observed_top1', 'Observed top-1'),
                        ('log_error_observed', 'Error in latest log')]), '', 'These are not final results and do not enter paired gains.', '']
     lines += [markdown_table(summary, [('student', 'Student'), ('method', 'Method'), ('guide', 'Guide'), ('guide_depth', 'Depth'),
+                                      ('prior_descriptor', 'Descriptor'), ('prior_start_stage', 'First stage'),
+                                      ('prior_update_scope', 'Update scope'), ('steps_per_phase', 'Steps/phase'),
                                       ('guide_seed', 'Guide seed'), ('epochs', 'Epochs'), ('n_student_seeds', 'Student seeds'),
                                       ('mean_delta_pp', 'Mean gain (pp)'), ('sd_delta_pp', 'SD (pp)'), ('condition_id', 'Condition')]) if summary else 'No valid matched comparisons yet.', '',
               '## Depth contrasts', '', 'These contrasts compare adjacent available depths within the same guide architecture series, '

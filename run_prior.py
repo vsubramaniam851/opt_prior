@@ -22,6 +22,8 @@ def get_run_args():
     parser.add_argument('--rep_val_interval', type = int, default = 250)
     parser.add_argument('--align_mix', type = float, default = 1.0)
     parser.add_argument('--prior_schedule', choices = ['cumulative', 'frozen'], default = 'cumulative')
+    parser.add_argument('--prior_start_stage', type = int, default = 1)
+    parser.add_argument('--prior_update_scope', choices = ['prefix', 'suffix'], default = 'prefix')
     parser.add_argument('--prior_min_rank_ratio', type = float, default = 0.0)
     parser.add_argument('--prior_norm', choices = ['batch', 'eval'], default = 'batch')
     parser.add_argument('--prior_descriptor', choices = ['pooled', 'spatial'], default = 'pooled')
@@ -40,6 +42,14 @@ def build_command(args):
         raise ValueError('The guide must match the family; --depth is only available for ViTs')
     if not resnet and args.depth is not None and args.depth < 4:
         raise ValueError('The ViT guide must have at least four blocks')
+    start = getattr(args, 'prior_start_stage', 1)
+    scope = getattr(args, 'prior_update_scope', 'prefix')
+    if not 1 <= start <= 4 or scope not in ['prefix', 'suffix']:
+        raise ValueError('Use prior_start_stage in 1-4 and prior_update_scope prefix or suffix')
+    if scope != 'prefix' and args.prior_schedule != 'cumulative':
+        raise ValueError('Suffix updates require the cumulative schedule')
+    if args.method == 'baseline' and (start != 1 or scope != 'prefix'):
+        raise ValueError('Alignment stage settings do not apply to a baseline')
     depth = args.depth
     if not resnet and guide == 'vit_tiny' and depth is None:
         depth = 4 if args.method == 'baseline' else 12
@@ -60,6 +70,10 @@ def build_command(args):
         name += '_bf16'
     if args.prior_descriptor != 'pooled' and args.method != 'baseline':
         name += '_spatial'
+    if start != 1:
+        name += f'_from{start}'
+    if scope != 'prefix':
+        name += '_suffix'
     name = args.exp_name or name
     method = 'CKA' if args.method == 'baseline' else args.method
     epochs = args.epochs if args.epochs is not None else (100 if resnet else 300)
@@ -81,6 +95,10 @@ def build_command(args):
                '--warmup_epochs', '5' if resnet else '20']
     if args.prior_descriptor != 'pooled':
         command += ['--prior_descriptor', args.prior_descriptor]
+    if start != 1:
+        command += ['--prior_start_stage', str(start)]
+    if scope != 'prefix':
+        command += ['--prior_update_scope', scope]
     if not resnet:
         command += ['--student_vit', 'vit_tiny']
     if depth is not None:

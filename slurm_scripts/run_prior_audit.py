@@ -27,8 +27,10 @@ def main():
         run = make_run(*mapping[index], env)
     elif group == 'spatial':
         run = make_run('D', index, env)
+    elif group == 'upper':
+        run = make_run('E', index, env)
     else:
-        raise ValueError('AUDIT_GROUP must be original or spatial')
+        raise ValueError('AUDIT_GROUP must be original, spatial or upper')
     root = Path(__file__).resolve().parents[1]
     name = run['name']
     output = root / 'geometry_audit' / (name + '.json')

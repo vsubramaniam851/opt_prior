@@ -44,6 +44,17 @@ def validate_prior_args(args):
         raise ValueError('prior_descriptor must be pooled or spatial')
     if args.prior_schedule not in ['cumulative', 'frozen']:
         raise ValueError('prior_schedule must be cumulative or frozen')
+    start = getattr(args, 'prior_start_stage', 1)
+    scope = getattr(args, 'prior_update_scope', 'prefix')
+    if not isinstance(start, int) or isinstance(start, bool) or start < 1 or scope not in ['prefix', 'suffix']:
+        raise ValueError('Use a positive integer prior_start_stage and prefix or suffix update scope')
+    layers = 4 if args.replacement_type == 'progressive_align_resnet' else {'vit_tiny': 4, 'vit_small': 8, 'vit_base': 12, 'vit_large': 24}.get(args.student_vit, 0)
+    if start > layers:
+        raise ValueError('prior_start_stage exceeds the student depth')
+    if scope != 'prefix' and args.prior_schedule != 'cumulative':
+        raise ValueError('Suffix updates require the cumulative schedule')
+    if args.baseline and (start != 1 or scope != 'prefix'):
+        raise ValueError('Alignment stage settings do not apply to a baseline')
     if args.repdist not in ['CKA', 'UCKA', 'KNN']:
         raise ValueError('The optimization prior requires CKA, UCKA or KNN')
     if args.repdist == 'KNN' and args.knn_loss != 'soft':
@@ -80,6 +91,10 @@ def prior_config(args):
         config['data_dir'] = os.path.realpath(os.path.expanduser(config['data_dir']))
     if getattr(args, 'prior_descriptor', 'pooled') != 'pooled':
         config['prior_descriptor'] = args.prior_descriptor
+    for name, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix')]:
+        value = getattr(args, name, default)
+        if value != default:
+            config[name] = value
     return config
 
 def check_prior_run(args):
@@ -165,29 +180,54 @@ def prior_parts(model):
     model = model.model if hasattr(model, 'model') else model
     return [model.conv_proj], list(model.encoder.layers), [model.class_token, model.encoder.pos_embedding]
 
-def prior_schedule(teacher, student, schedule = 'cumulative'):
-    if schedule not in ['cumulative', 'frozen']:
-        raise ValueError('Unknown progressive alignment schedule')
+def prior_schedule(teacher, student, schedule = 'cumulative', start_stage = 1, update_scope = 'prefix'):
+    if schedule not in ['cumulative', 'frozen'] or update_scope not in ['prefix', 'suffix']:
+        raise ValueError('Unknown progressive alignment schedule or update scope')
+    if update_scope == 'suffix' and schedule != 'cumulative':
+        raise ValueError('Suffix updates require the cumulative schedule')
     stem, blocks, global_params = prior_parts(student)
     _, teacher_blocks, _ = prior_parts(teacher)
     if len(teacher_blocks) < len(blocks):
         raise ValueError('The guide must have at least as many segments as the student')
+    if not isinstance(start_stage, int) or isinstance(start_stage, bool) or not 1 <= start_stage <= len(blocks):
+        raise ValueError('The first alignment stage must lie within the student')
+    first = start_stage - 1
     stages = []
-    for index, block in enumerate(blocks):
+    for index in range(first, len(blocks)):
         target = math.ceil((index + 1) * len(teacher_blocks) / len(blocks)) - 1
-        modules = stem + blocks[:index + 1] if schedule == 'cumulative' else (stem + [block] if index == 0 else [block])
+        begin = first if update_scope == 'suffix' else 0
+        if schedule == 'cumulative':
+            modules = (stem if begin == 0 else []) + blocks[begin:index + 1]
+        else:
+            modules = stem + [blocks[index]] if index == 0 else [blocks[index]]
         params = [p for module in modules for p in module.parameters()]
-        if schedule == 'cumulative' or index == 0:
+        if (schedule == 'cumulative' and begin == 0) or index == 0:
             params += global_params
         stages.append((index, target, params))
     return stages
 
-def prior_endpoints(teacher, student, index, schedule):
+def prior_endpoints(teacher, student, index, schedule, start_stage = 1):
     _, blocks, _ = prior_parts(student)
     _, teacher_blocks, _ = prior_parts(teacher)
-    indices = list(range(index + 1)) if schedule == 'cumulative' else [index]
+    if schedule not in ['cumulative', 'frozen'] or not 1 <= start_stage <= index + 1 <= len(blocks):
+        raise ValueError('Invalid progressive alignment endpoints')
+    indices = list(range(start_stage - 1, index + 1)) if schedule == 'cumulative' else [index]
     targets = [math.ceil((i + 1) * len(teacher_blocks) / len(blocks)) - 1 for i in indices]
     return indices, targets
+
+def prior_segment_changes(student, initial):
+    stem, blocks, global_params = prior_parts(student)
+    groups = {'stem': [p for module in stem for p in module.parameters()] + global_params}
+    groups.update({f'stage{i + 1}': list(block.parameters()) for i, block in enumerate(blocks)})
+    names = {id(p): name for name, p in student.named_parameters()}
+    changes = {}
+    for group, params in groups.items():
+        delta = sum((p.detach().cpu() - initial[names[id(p)]]).float().square().sum().item() for p in params)
+        norm = sum(initial[names[id(p)]].float().square().sum().item() for p in params)
+        changes[group] = {'relative_change': math.sqrt(delta / max(norm, 1e-12)),
+                          'changed': any(not torch.equal(p.detach().cpu(), initial[names[id(p)]]) for p in params),
+                          'trainable_parameters': sum(p.numel() for p in params if p.requires_grad)}
+    return changes
 
 def prior_forward(model, images, indices, pool_hw = None, descriptor = 'pooled'):
     single = isinstance(indices, int)
@@ -311,7 +351,7 @@ def prior_batch(args, teacher, student, images, student_indices, teacher_indices
     return torch.stack(losses).mean(), losses, features, targets
 
 def prior_evaluate(args, teacher, student, loader, student_index, teacher_index, device):
-    student_indices, teacher_indices = prior_endpoints(teacher, student, student_index, args.prior_schedule)
+    student_indices, teacher_indices = prior_endpoints(teacher, student, student_index, args.prior_schedule, getattr(args, 'prior_start_stage', 1))
     if teacher_indices[-1] != teacher_index:
         raise ValueError('Guide endpoint does not match the progressive schedule')
     sums = {}
@@ -347,7 +387,7 @@ def prior_rank_ok(args, metrics, initial):
 
 def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, device):
     index, target_index, params = stage
-    student_indices, teacher_indices = prior_endpoints(teacher, student, index, args.prior_schedule)
+    student_indices, teacher_indices = prior_endpoints(teacher, student, index, args.prior_schedule, getattr(args, 'prior_start_stage', 1))
     student.requires_grad_(False)
     teacher.requires_grad_(False)
     student.zero_grad(set_to_none = True)
@@ -421,10 +461,18 @@ def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, d
                 for name, value in student.named_parameters())
     norm = sum(initial[name].float().square().sum().item() for name, p in student.named_parameters() if p.requires_grad)
     student.zero_grad(set_to_none = True)
+    segment_changes = prior_segment_changes(student, initial)
+    first = getattr(args, 'prior_start_stage', 1)
+    lower = ['stem'] + [f'stage{i}' for i in range(1, first)]
+    lower_unchanged = all(not segment_changes[name]['changed'] for name in lower)
+    if getattr(args, 'prior_update_scope', 'prefix') == 'suffix' and first > 1 and not lower_unchanged:
+        raise RuntimeError('A lower student segment changed during suffix-only alignment')
     summary = {'student_endpoint': index + 1, 'teacher_endpoint': target_index + 1, 'steps': steps,
                'schedule': args.prior_schedule, 'active_endpoints': [[i + 1, j + 1] for i, j in zip(student_indices, teacher_indices)],
                'trainable_parameters': sum(p.numel() for p in params), 'rank_gate_enabled': args.prior_min_rank_ratio > 0,
-               'align_mix': args.align_mix,
+               'align_mix': args.align_mix, 'prior_start_stage': first,
+               'prior_update_scope': getattr(args, 'prior_update_scope', 'prefix'),
+               'parameter_changes_by_segment': segment_changes, 'lower_prefix_unchanged': lower_unchanged,
                'best_step': best_step, 'accepted': accepted, 'relative_parameter_change': math.sqrt(delta / max(norm, 1e-12)),
                'initial': initial_metrics, 'best_unmixed': best_metrics, 'final': final_metrics, 'history': history}
     prior_log({f'{prefix}/accepted': int(accepted), f'{prefix}/relative_parameter_change': summary['relative_parameter_change'],
@@ -457,7 +505,8 @@ def initialize_optimization_prior(args, teacher, device, initialize_only = False
     train_loader, val_loader, indices = make_prior_loaders(args)
     metadata['validation_indices'] = indices
     metadata['validation_source'] = 'held-out ImageNet training images, excluded from alignment updates'
-    for stage in prior_schedule(teacher, student, args.prior_schedule):
+    for stage in prior_schedule(teacher, student, args.prior_schedule, getattr(args, 'prior_start_stage', 1),
+                                getattr(args, 'prior_update_scope', 'prefix')):
         index = stage[0]
         metadata['stages'][f'stage{index + 1}'] = align_prior_stage(args, teacher, student, train_loader, val_loader, stage, device)
         torch.save(student.state_dict(), f'saved_models/{args.exp_name}/prior_stage{index + 1}.pt')
