@@ -151,6 +151,9 @@ def get_args():
     parser.add_argument('--prior_schedule', choices = ['cumulative', 'frozen'], default = 'cumulative')
     parser.add_argument('--prior_start_stage', type = int, default = 1)
     parser.add_argument('--prior_update_scope', choices = ['prefix', 'suffix'], default = 'prefix')
+    parser.add_argument('--prior_bn_affine', choices = ['train', 'fixed'], default = 'train')
+    parser.add_argument('--prior_final_steps', type = int, default = None)
+    parser.add_argument('--prior_log_gradients', action = 'store_true')
     parser.add_argument('--prior_min_rank_ratio', type = float, default = 0.0)
     parser.set_defaults(low_rank = True, tune_linear = False, reload_cka = False, reload_ft = False, scheduler = False, pretrained = True, 
                         task_loss = False, rep_scheduler = False, reload_progressive = False, svd_init = False, post_activation = False,
