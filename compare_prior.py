@@ -29,12 +29,13 @@ TRAINING_KEYS = ['setting', 'imagenet', 'data_dir', 'ft_epochs', 'ft_batch', 'ft
 ALIGNMENT_KEYS = ['repdist', 'cka_loss', 'knn_loss', 'knn_k', 'knn_temp', 'rep_batch', 'rep_val_size',
                   'rep_split_seed', 'rep_val_interval', 'max_stage_steps', 'progressive_lrs', 'progressive_epochs',
                   'rep_wd', 'rep_scheduler', 'pool_hw', 'prior_schedule', 'align_mix', 'prior_min_rank_ratio',
-                  'prior_norm', 'prior_descriptor', 'prior_start_stage', 'prior_update_scope', 'anchor_to_init', 'anchor_lambda']
+                  'prior_norm', 'prior_descriptor', 'prior_start_stage', 'prior_update_scope', 'prior_bn_affine', 'prior_final_steps', 'anchor_to_init', 'anchor_lambda']
 METRICS = ['loss', 'cka', 'ucka', 'knn_overlap', 'student_rank', 'teacher_rank', 'student_centered_rms', 'teacher_centered_rms']
 SOURCE_FILES = ['args.py', 'run_prior.py', 'theseus.py', 'prior_utils.py', 'rep_sims.py', 'finetune.py',
                 'dataloader.py', 'vits.py', 'slurm_scripts/run_prior_array.py', 'compare_prior.py',
                 'audit_prior_geometry.py', 'restart_prior_baseline.py', 'slurm_scripts/run_prior_audit.py',
-                'slurm_scripts/prior_e_upper.sbatch']
+                'slurm_scripts/prior_e_upper.sbatch', 'slurm_scripts/prior_f_bn_dose.sbatch',
+                'audit_prior_mechanism.py', 'slurm_scripts/run_prior_mechanism.py', 'slurm_scripts/prior_mechanism_audit.sbatch']
 VITS = {'vit_tiny': (192, 4), 'vit_small': (384, 8), 'vit_base': (768, 12), 'vit_large': (1024, 24)}
 SECRET_KEYS = {'api_key', 'wandb_api_key', 'hf_token', 'access_token', 'auth_token', 'password', 'secret', 'token'}
 
@@ -209,7 +210,7 @@ def load_run(root, folder):
         issue(run, 'alignment_no_op', 'The retained initialization has the same recorded state hash as the random student')
     alignment = meta.get('alignment_config', {})
     mismatches = [key for key, value in alignment.items() if key in config and config[key] != value]
-    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix')]:
+    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix'), ('prior_bn_affine', 'train'), ('prior_final_steps', None)]:
         if alignment.get(key, default) != config.get(key, default) and key not in mismatches:
             mismatches.append(key)
     if not alignment or mismatches:
@@ -247,7 +248,7 @@ def load_run(root, folder):
     run['recipe_id'] = digest(clean(recipe))
     controls = {key: alignment.get(key, config.get(key)) for key in ALIGNMENT_KEYS}
     controls['prior_descriptor'] = alignment.get('prior_descriptor', config.get('prior_descriptor', 'pooled'))
-    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix')]:
+    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix'), ('prior_bn_affine', 'train'), ('prior_final_steps', None)]:
         controls[key] = alignment.get(key, config.get(key, default))
     controls['validation_indices_hash'] = digest(meta['validation_indices']) if isinstance(meta.get('validation_indices'), list) else None
     run['alignment_controls'] = controls
@@ -369,6 +370,8 @@ def condition_summary(runs):
                        'prior_descriptor': first['alignment_controls']['prior_descriptor'],
                        'prior_start_stage': first['alignment_controls']['prior_start_stage'],
                        'prior_update_scope': first['alignment_controls']['prior_update_scope'],
+                       'prior_bn_affine': first['alignment_controls']['prior_bn_affine'],
+                       'prior_final_steps': first['alignment_controls']['prior_final_steps'],
                        'steps_per_phase': first['alignment_controls']['max_stage_steps'],
                        'alignment_id': first['alignment_id'], 'student_seeds': sorted(run['seed'] for run in entries),
                        'n_student_seeds': len(entries), 'mean_final_top1': average([run['final_top1'] for run in entries]),
@@ -409,7 +412,7 @@ def slurm_observations(root, runs):
             with source.open(errors = 'replace') as handle:
                 for line in handle:
                     line = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line)
-                    match = re.search(r'Array [BCDE]\[\d+\]: (.*?), epochs=', line)
+                    match = re.search(r'Array [BCDEF]\[\d+\]: (.*?), epochs=', line)
                     if match:
                         name = match.group(1)
                     for match in pattern.finditer(line):
@@ -439,7 +442,8 @@ def inventory_row(run, observations):
     controls = run.get('alignment_controls', meta.get('alignment_config', {}))
     row.update({'prior_descriptor': controls.get('prior_descriptor', 'pooled'),
                 'prior_start_stage': controls.get('prior_start_stage', 1), 'prior_update_scope': controls.get('prior_update_scope', 'prefix'),
-                'steps_per_phase': controls.get('max_stage_steps'),
+                'steps_per_phase': controls.get('max_stage_steps'), 'prior_bn_affine': controls.get('prior_bn_affine', 'train'),
+                'prior_final_steps': controls.get('prior_final_steps'),
                 'schedule': meta.get('schedule'), 'align_mix': meta.get('align_mix'),
                 'rank_gate_enabled': meta.get('rank_gate_enabled'), 'guide_unchanged': meta.get('guide_unchanged'),
                 'initialization_hash': meta.get('student_initial_hash'), 'aligned_hash': meta.get('student_aligned_hash'),
@@ -511,7 +515,10 @@ def short_label(run):
     start = controls.get('prior_start_stage', 1)
     scope = controls.get('prior_update_scope', 'prefix')
     steps = controls.get('max_stage_steps')
-    return f'{method} / {guide} / {descriptor} / from{start} {scope} / {steps} steps / s{seed} g{guide_seed} / {schedule} a={mix}'
+    affine = controls.get('prior_bn_affine', 'train')
+    cap = controls.get('prior_final_steps')
+    suffix = '' if affine == 'train' and cap is None else f' / BN={affine} stop={cap}'
+    return f'{method} / {guide} / {descriptor} / from{start} {scope} / {steps} steps / s{seed} g{guide_seed} / {schedule} a={mix}' + suffix
 
 def figure(title, xlabel, ylabel, size = (9, 5)):
     fig = Figure(figsize = size, dpi = 150)
@@ -646,7 +653,8 @@ def report_text(runs, inventory, summary, depths, issues, plot_paths):
                        ('log_error_observed', 'Error in latest log')]), '', 'These are not final results and do not enter paired gains.', '']
     lines += [markdown_table(summary, [('student', 'Student'), ('method', 'Method'), ('guide', 'Guide'), ('guide_depth', 'Depth'),
                                       ('prior_descriptor', 'Descriptor'), ('prior_start_stage', 'First stage'),
-                                      ('prior_update_scope', 'Update scope'), ('steps_per_phase', 'Steps/phase'),
+                                      ('prior_update_scope', 'Update scope'), ('steps_per_phase', 'Schedule/phase'),
+                                      ('prior_final_steps', 'Final cap'), ('prior_bn_affine', 'BN affine'),
                                       ('guide_seed', 'Guide seed'), ('epochs', 'Epochs'), ('n_student_seeds', 'Student seeds'),
                                       ('mean_delta_pp', 'Mean gain (pp)'), ('sd_delta_pp', 'SD (pp)'), ('condition_id', 'Condition')]) if summary else 'No valid matched comparisons yet.', '',
               '## Depth contrasts', '', 'These contrasts compare adjacent available depths within the same guide architecture series, '
@@ -705,13 +713,14 @@ def bundle_results(root, output, runs, artifacts, observations, include_code, in
                     archive.writestr('code/' + name, text_redact(path.read_text()))
         if include_geometry:
             for run in runs:
-                path = root / 'geometry_audit' / (run['experiment'] + '.json')
-                if path.is_file():
-                    geometry = read_json(path)
-                    if geometry.get('experiment') != run['experiment']:
-                        raise ValueError('Geometry audit experiment mismatch: ' + str(path))
-                    archive.writestr('geometry_audit/' + path.name, json.dumps(clean(geometry), indent = 2, allow_nan = False))
-                    manifest['files'].append({'path': str(path.relative_to(root)), 'original_sha256': file_hash(path)})
+                for directory in ['geometry_audit', 'mechanism_audit']:
+                    path = root / directory / (run['experiment'] + '.json')
+                    if path.is_file():
+                        geometry = read_json(path)
+                        if geometry.get('experiment') != run['experiment']:
+                            raise ValueError('Geometry audit experiment mismatch: ' + str(path))
+                        archive.writestr(directory + '/' + path.name, json.dumps(clean(geometry), indent = 2, allow_nan = False))
+                        manifest['files'].append({'path': str(path.relative_to(root)), 'original_sha256': file_hash(path)})
         archive.writestr('manifest.json', json.dumps(clean(manifest), indent = 2, allow_nan = False))
         archive.writestr('README.txt', 'Upload this archive for analysis. No checkpoints, dataset images, environment variables, or W&B directories are included.\n'
                          'All validation curves and available alignment/argument metadata are included. Batchwise loss/norm arrays are summarized.\n'

@@ -24,6 +24,9 @@ def get_run_args():
     parser.add_argument('--prior_schedule', choices = ['cumulative', 'frozen'], default = 'cumulative')
     parser.add_argument('--prior_start_stage', type = int, default = 1)
     parser.add_argument('--prior_update_scope', choices = ['prefix', 'suffix'], default = 'prefix')
+    parser.add_argument('--prior_bn_affine', choices = ['train', 'fixed'], default = 'train')
+    parser.add_argument('--prior_final_steps', type = int, default = None)
+    parser.add_argument('--prior_log_gradients', action = 'store_true')
     parser.add_argument('--prior_min_rank_ratio', type = float, default = 0.0)
     parser.add_argument('--prior_norm', choices = ['batch', 'eval'], default = 'batch')
     parser.add_argument('--prior_descriptor', choices = ['pooled', 'spatial'], default = 'pooled')
@@ -50,6 +53,12 @@ def build_command(args):
         raise ValueError('Suffix updates require the cumulative schedule')
     if args.method == 'baseline' and (start != 1 or scope != 'prefix'):
         raise ValueError('Alignment stage settings do not apply to a baseline')
+    affine = getattr(args, 'prior_bn_affine', 'train')
+    cap = getattr(args, 'prior_final_steps', None)
+    if affine != 'train' and (not resnet or args.method == 'baseline'):
+        raise ValueError('Fixed BN affine is an alignment-only ResNet control')
+    if cap is not None and (args.method == 'baseline' or not 1 <= cap <= args.steps):
+        raise ValueError('prior_final_steps must lie in 1..steps for an aligned run')
     depth = args.depth
     if not resnet and guide == 'vit_tiny' and depth is None:
         depth = 4 if args.method == 'baseline' else 12
@@ -74,6 +83,10 @@ def build_command(args):
         name += f'_from{start}'
     if scope != 'prefix':
         name += '_suffix'
+    if affine != 'train':
+        name += '_bnfixed'
+    if cap is not None:
+        name += f'_stop{cap}'
     name = args.exp_name or name
     method = 'CKA' if args.method == 'baseline' else args.method
     epochs = args.epochs if args.epochs is not None else (100 if resnet else 300)
@@ -99,6 +112,12 @@ def build_command(args):
         command += ['--prior_start_stage', str(start)]
     if scope != 'prefix':
         command += ['--prior_update_scope', scope]
+    if affine != 'train':
+        command += ['--prior_bn_affine', affine]
+    if cap is not None:
+        command += ['--prior_final_steps', str(cap)]
+    if getattr(args, 'prior_log_gradients', False):
+        command += ['--prior_log_gradients']
     if not resnet:
         command += ['--student_vit', 'vit_tiny']
     if depth is not None:

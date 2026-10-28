@@ -55,6 +55,13 @@ def validate_prior_args(args):
         raise ValueError('Suffix updates require the cumulative schedule')
     if args.baseline and (start != 1 or scope != 'prefix'):
         raise ValueError('Alignment stage settings do not apply to a baseline')
+    if getattr(args, 'prior_bn_affine', 'train') not in ['train', 'fixed']:
+        raise ValueError('prior_bn_affine must be train or fixed')
+    if getattr(args, 'prior_bn_affine', 'train') != 'train' and (args.baseline or args.replacement_type != 'progressive_align_resnet'):
+        raise ValueError('Fixed BN affine is an alignment-only ResNet control')
+    cap = getattr(args, 'prior_final_steps', None)
+    if cap is not None and (args.baseline or args.max_stage_steps is None or not 1 <= cap <= args.max_stage_steps):
+        raise ValueError('prior_final_steps requires a non-baseline run and must lie in 1..max_stage_steps')
     if args.repdist not in ['CKA', 'UCKA', 'KNN']:
         raise ValueError('The optimization prior requires CKA, UCKA or KNN')
     if args.repdist == 'KNN' and args.knn_loss != 'soft':
@@ -95,6 +102,10 @@ def prior_config(args):
         value = getattr(args, name, default)
         if value != default:
             config[name] = value
+    if getattr(args, 'prior_bn_affine', 'train') != 'train':
+        config['prior_bn_affine'] = args.prior_bn_affine
+    if getattr(args, 'prior_final_steps', None) is not None:
+        config['prior_final_steps'] = args.prior_final_steps
     return config
 
 def check_prior_run(args):
@@ -385,14 +396,73 @@ def prior_rank_ok(args, metrics, initial):
     names = [name for name in initial if name.startswith('endpoint') and name.endswith('_student_rank')]
     return all(metrics[name] >= args.prior_min_rank_ratio * initial[name] for name in names)
 
+def prior_lr_factor(step, horizon):
+    if horizon < 1 or step < 0 or step >= horizon:
+        raise ValueError('Invalid alignment learning-rate step or horizon')
+    warmup = max(1, int(horizon * 0.1))
+    return 0.1 + 0.9 * step / warmup if step < warmup else 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, horizon - warmup)))
+
+def prior_named_parameters(model):
+    kinds = {}
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            for name, param in module.named_parameters(recurse = False):
+                kinds[id(param)] = 'bn_scale' if name == 'weight' else 'bn_bias'
+        elif isinstance(module, nn.Conv2d):
+            for param in module.parameters(recurse = False):
+                kinds[id(param)] = 'conv'
+    return [(name, param, kinds.get(id(param), 'other')) for name, param in model.named_parameters()]
+
+def prior_trainable_parameters(student, params, affine = 'train'):
+    if affine not in ['train', 'fixed']:
+        raise ValueError('Unknown BN affine alignment policy')
+    student.requires_grad_(False)
+    student.zero_grad(set_to_none = True)
+    fixed = {id(param) for _, param, kind in prior_named_parameters(student) if kind.startswith('bn_')}
+    selected = [param for param in params if affine == 'train' or id(param) not in fixed]
+    for param in selected:
+        param.requires_grad_(True)
+    if not selected:
+        raise ValueError('No trainable alignment parameters remain')
+    return selected
+
+def prior_parameter_diagnostics(model, initial = None):
+    groups = {}
+    for name, param, kind in prior_named_parameters(model):
+        row = groups.setdefault(kind, {'parameters': 0, 'trainable_parameters': 0, 'tensors': 0,
+                                      'trainable_tensors': 0, 'gradient_tensors': 0, 'nonzero_gradient_tensors': 0,
+                                      'gradient_squared_norm': 0.0, 'parameter_squared_norm': 0.0,
+                                      'delta_squared_norm': 0.0, 'initial_squared_norm': 0.0})
+        row['parameters'] += param.numel()
+        row['trainable_parameters'] += param.numel() if param.requires_grad else 0
+        row['tensors'] += 1
+        row['trainable_tensors'] += int(param.requires_grad)
+        row['parameter_squared_norm'] += param.detach().float().square().sum().item()
+        if param.grad is not None:
+            grad = param.grad.detach().float()
+            if not torch.isfinite(grad).all():
+                raise FloatingPointError('Non-finite parameter gradient: ' + name)
+            squared = grad.square().sum().item()
+            row['gradient_squared_norm'] += squared
+            row['gradient_tensors'] += 1
+            row['nonzero_gradient_tensors'] += int(squared > 0)
+        if initial is not None:
+            start = initial[name].to(param.device).float()
+            row['initial_squared_norm'] += start.square().sum().item()
+            row['delta_squared_norm'] += (param.detach().float() - start).square().sum().item()
+    total = sum(row['gradient_squared_norm'] for row in groups.values())
+    for row in groups.values():
+        row['gradient_rms'] = math.sqrt(row['gradient_squared_norm'] / max(1, row['trainable_parameters']))
+        row['gradient_squared_fraction'] = row['gradient_squared_norm'] / total if total > 0 else 0.0
+        row['change_rms'] = math.sqrt(row['delta_squared_norm'] / max(1, row['parameters'])) if initial is not None else None
+        row['relative_change'] = math.sqrt(row['delta_squared_norm'] / row['initial_squared_norm']) if initial is not None and row['initial_squared_norm'] > 0 else None
+    return groups
+
 def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, device):
     index, target_index, params = stage
     student_indices, teacher_indices = prior_endpoints(teacher, student, index, args.prior_schedule, getattr(args, 'prior_start_stage', 1))
-    student.requires_grad_(False)
+    params = prior_trainable_parameters(student, params, getattr(args, 'prior_bn_affine', 'train'))
     teacher.requires_grad_(False)
-    student.zero_grad(set_to_none = True)
-    for p in params:
-        p.requires_grad_(True)
     initial = prior_state(student)
     initial_metrics = prior_evaluate(args, teacher, student, val_loader, index, target_index, device)
     best_metrics = dict(initial_metrics)
@@ -401,6 +471,12 @@ def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, d
     lr = args.progressive_lrs[min(index, len(args.progressive_lrs) - 1)]
     epochs = args.progressive_epochs[min(index, len(args.progressive_epochs) - 1)]
     steps = args.max_stage_steps if args.max_stage_steps is not None else epochs * len(train_loader)
+    schedule_steps = steps
+    if index == len(prior_parts(student)[1]) - 1 and getattr(args, 'prior_final_steps', None) is not None:
+        steps = args.prior_final_steps
+        if not 1 <= steps <= schedule_steps:
+            raise ValueError('Final phase cap must lie within the original schedule')
+    gradient_history = []
     if steps < 1:
         raise ValueError('The alignment training loader is empty')
     optimizer = torch.optim.AdamW(params, lr = lr, weight_decay = args.rep_wd)
@@ -419,8 +495,7 @@ def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, d
                 images, _ = next(iterator)
             images = images.to(device, non_blocking = True)
             if args.rep_scheduler:
-                warmup = max(1, int(steps * 0.1))
-                factor = 0.1 + 0.9 * step / warmup if step < warmup else 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, steps - warmup)))
+                factor = prior_lr_factor(step, schedule_steps)
                 for group in optimizer.param_groups:
                     group['lr'] = lr * factor
             loss, endpoint_losses, _, _ = prior_batch(args, teacher, student, images, student_indices, teacher_indices)
@@ -431,6 +506,10 @@ def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, d
                 raise FloatingPointError(f'Non-finite alignment loss at stage {index + 1}, step {step + 1}')
             optimizer.zero_grad(set_to_none = True)
             loss.backward()
+            if getattr(args, 'prior_log_gradients', False) and (step == 0 or (step + 1) % args.rep_val_interval == 0 or step + 1 == steps):
+                diagnostics = prior_parameter_diagnostics(student, initial)
+                gradient_history.append({'step': step + 1, 'lr': optimizer.param_groups[0]['lr'], 'groups': diagnostics})
+                prior_log({f'{prefix}/{name}_gradient_rms': value['gradient_rms'] for name, value in diagnostics.items()})
             grad_norm = nn.utils.clip_grad_norm_(params, 1.0, error_if_nonfinite = True)
             optimizer.step()
             if (step + 1) % 20 == 0:
@@ -475,6 +554,14 @@ def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, d
                'parameter_changes_by_segment': segment_changes, 'lower_prefix_unchanged': lower_unchanged,
                'best_step': best_step, 'accepted': accepted, 'relative_parameter_change': math.sqrt(delta / max(norm, 1e-12)),
                'initial': initial_metrics, 'best_unmixed': best_metrics, 'final': final_metrics, 'history': history}
+    if getattr(args, 'prior_log_gradients', False):
+        summary.update({'schedule_steps': schedule_steps, 'gradient_history': gradient_history,
+                        'parameter_changes_by_type': prior_parameter_diagnostics(student, initial)})
+    if getattr(args, 'prior_bn_affine', 'train') == 'fixed':
+        fixed = all(torch.equal(value.detach().cpu(), initial[name]) for name, value, kind in prior_named_parameters(student) if kind.startswith('bn_'))
+        if not fixed:
+            raise RuntimeError('BN affine parameters changed during fixed-affine alignment')
+        summary['bn_affine_unchanged'] = fixed
     prior_log({f'{prefix}/accepted': int(accepted), f'{prefix}/relative_parameter_change': summary['relative_parameter_change'],
                **{f'{prefix}/selected_{name}': value for name, value in final_metrics.items()}})
     return summary
