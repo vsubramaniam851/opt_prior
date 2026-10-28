@@ -27,7 +27,8 @@ RUNS = {
           ('resnet', 'CKA', 'rn152', None), ('resnet', 'KNN', 'rn152', None),
           ('vit', 'CKA', 'vit_tiny', 24), ('vit', 'KNN', 'vit_tiny', 24)],
     'E': [('resnet', 'CKA', 'rn50', None), ('resnet', 'KNN', 'rn50', None),
-          ('resnet', 'CKA', 'rn50', None), ('resnet', 'KNN', 'rn50', None)]
+          ('resnet', 'CKA', 'rn50', None), ('resnet', 'KNN', 'rn50', None)],
+    'F': [('resnet', method, 'rn50', None) for _ in range(5) for method in ['CKA', 'KNN']]
 }
 TRAINING_KEYS = ['seed', 'ft_epochs', 'ft_batch', 'ft_accum', 'ft_optimizer', 'ft_lr', 'ft_wd', 'ft_clip',
                  'label_smoothing', 'mixup_alpha', 'scheduler', 'scheduler_type', 'warmup_epochs', 'use_amp']
@@ -48,25 +49,32 @@ def env_int(env, name, default, minimum = 0):
 
 def make_run(group, index, env):
     if group not in RUNS or index < 0 or index >= len(RUNS[group]):
-        raise ValueError('Use B indices 0-5, C indices 0-11, D indices 0-7 or E indices 0-3')
+        raise ValueError('Use B indices 0-5, C indices 0-11, D indices 0-7, E indices 0-3 or F indices 0-9')
     if not env.get('DATA_DIR'):
         raise ValueError('Set DATA_DIR to the ImageNet directory containing train and val')
     family, method, guide, depth = RUNS[group][index]
     default_epochs = 100 if family == 'resnet' else 300
     epochs = env_int(env, 'RESNET_EPOCHS' if family == 'resnet' else 'VIT_EPOCHS', default_epochs, 6 if family == 'resnet' else 21)
     phase = 'train' if group == 'B' and method != 'baseline' else 'full'
-    if group in ['D', 'E']:
+    if group in ['D', 'E', 'F']:
         phase = env.get('PRIOR_PHASE', 'align')
         if phase not in ['align', 'train', 'full']:
             raise ValueError('PRIOR_PHASE must be align, train or full')
     argv = [family, method, '--guide', guide, '--data_dir', str(Path(env['DATA_DIR']).expanduser().resolve()),
             '--seed', str(env_int(env, 'SEED', 0)), '--teacher_seed', str(env_int(env, 'TEACHER_SEED', 1000)),
             '--workers', str(env_int(env, 'WORKERS', 8)), '--phase', phase, '--epochs', str(epochs)]
-    if group in ['D', 'E']:
+    if group in ['D', 'E', 'F']:
         argv += ['--prior_descriptor', 'spatial']
     if group == 'E':
         steps = env_int(env, 'ALIGN_STEPS', 2000, 1)
         argv += ['--prior_start_stage', '3', '--prior_update_scope', 'prefix' if index < 2 else 'suffix', '--steps', str(steps)]
+    if group == 'F':
+        cap, affine = [(250, 'train'), (1000, 'train'), (None, 'fixed'), (250, 'fixed'), (1000, 'fixed')][index // 2]
+        steps = 2000
+        argv += ['--prior_start_stage', '3', '--prior_update_scope', 'suffix', '--steps', str(steps),
+                 '--prior_bn_affine', affine, '--prior_log_gradients']
+        if cap is not None:
+            argv += ['--prior_final_steps', str(cap)]
     if depth is not None:
         argv += ['--depth', str(depth)]
     amp = env_int(env, 'AMP', 0)
@@ -77,7 +85,7 @@ def make_run(group, index, env):
     args = parse_with(get_run_args, argv)
     initial_command = build_command(args)
     source = initial_command[initial_command.index('--exp_name') + 1]
-    if group == 'E':
+    if group in ['E', 'F']:
         source += f'_steps{steps}'
     name = source if epochs == default_epochs else f'{source}_e{epochs}'
     argv += ['--exp_name', name]
@@ -102,7 +110,7 @@ def validate_initialization(root, name, run):
     if not config or not metadata.get('student_aligned_hash'):
         raise ValueError(f'Missing alignment configuration or state fingerprint for {name}')
     mismatched = [key for key, value in config.items() if run['training'].get(key) != value]
-    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix')]:
+    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix'), ('prior_bn_affine', 'train'), ('prior_final_steps', None)]:
         if config.get(key, default) != run['training'].get(key, default) and key not in mismatched:
             mismatched.append(key)
     if mismatched:
@@ -222,7 +230,7 @@ def execute(root, run, env):
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in RUNS:
-        raise ValueError('Run from network_theseus: python3 -m slurm_scripts.run_prior_array B, C, D or E')
+        raise ValueError('Run from network_theseus: python3 -m slurm_scripts.run_prior_array B, C, D, E or F')
     env = dict(os.environ)
     index = env_int(env, 'SLURM_ARRAY_TASK_ID', -1)
     run = make_run(sys.argv[1], index, env)
