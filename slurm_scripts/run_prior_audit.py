@@ -31,8 +31,10 @@ def main():
         run = make_run('E', index, env)
     elif group == 'bn_dose':
         run = make_run('F', index, env)
+    elif group == 'views':
+        run = make_run('G', index, env)
     else:
-        raise ValueError('AUDIT_GROUP must be original, spatial, upper or bn_dose')
+        raise ValueError('AUDIT_GROUP must be original, spatial, upper, bn_dose or views')
     root = Path(__file__).resolve().parents[1]
     name = run['name']
     output = root / 'geometry_audit' / (name + '.json')

@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
+from prior_views import PriorViewDataset, view_batch_size, view_diagnostics, view_images, view_loss, view_spec, view_transform
 from rep_sims import CKA, DifferentiableKNN
 from vits import ViT
 
@@ -40,8 +41,15 @@ def validate_prior_args(args):
         raise ValueError('Use full downstream training and select alignment normalization with --prior_norm')
     if args.reload_progressive or args.continue_ft or args.bit8_adam or args.measure_alignment:
         raise ValueError('This preset supports --reload_ft, but not legacy continuation or alignment diagnostics')
-    if getattr(args, 'prior_descriptor', 'pooled') not in ['pooled', 'spatial']:
-        raise ValueError('prior_descriptor must be pooled or spatial')
+    if getattr(args, 'prior_descriptor', 'pooled') not in ['pooled', 'spatial', 'spatial_only']:
+        raise ValueError('prior_descriptor must be pooled, spatial or spatial_only')
+    mode = getattr(args, 'prior_view_mode', 'single')
+    if mode not in ['single', 'separate', 'shared']:
+        raise ValueError('prior_view_mode must be single, separate or shared')
+    if not 0 < getattr(args, 'prior_view_crop_min', 0.5) <= 1 or getattr(args, 'prior_view_seed', 41000) < 0:
+        raise ValueError('Invalid two-view crop scale or validation seed')
+    if mode != 'single' and (args.baseline or getattr(args, 'prior_descriptor', 'pooled') != 'spatial_only'):
+        raise ValueError('Two-view alignment requires spatial_only descriptors and a non-baseline run')
     if args.prior_schedule not in ['cumulative', 'frozen']:
         raise ValueError('prior_schedule must be cumulative or frozen')
     start = getattr(args, 'prior_start_stage', 1)
@@ -106,6 +114,10 @@ def prior_config(args):
         config['prior_bn_affine'] = args.prior_bn_affine
     if getattr(args, 'prior_final_steps', None) is not None:
         config['prior_final_steps'] = args.prior_final_steps
+    if getattr(args, 'prior_view_mode', 'single') != 'single':
+        config.update({'prior_view_mode': args.prior_view_mode,
+                       'prior_view_crop_min': getattr(args, 'prior_view_crop_min', 0.5),
+                       'prior_view_seed': getattr(args, 'prior_view_seed', 41000)})
     return config
 
 def check_prior_run(args):
@@ -262,8 +274,9 @@ def prior_forward(model, images, indices, pool_hw = None, descriptor = 'pooled')
 
 def prior_features(z, pool_hw = 4, descriptor = 'pooled'):
     z = z if z.dtype == torch.float64 else z.float()
-    if descriptor == 'spatial':
-        return prior_spatial_features(z, pool_hw)
+    if descriptor in ['spatial', 'spatial_only']:
+        features = prior_spatial_features(z, pool_hw)
+        return features[:1] if descriptor == 'spatial_only' else features
     if descriptor != 'pooled':
         raise ValueError('Unknown representation descriptor')
     if z.dim() == 4:
@@ -331,8 +344,14 @@ def make_prior_loaders(args):
                                          transforms.ToTensor(), transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
     val_transform = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor(),
                                        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
-    train_set = torchvision.datasets.ImageFolder(root, transform = train_transform)
-    val_set = torchvision.datasets.ImageFolder(root, transform = val_transform)
+    if getattr(args, 'prior_view_mode', 'single') == 'single':
+        train_set = torchvision.datasets.ImageFolder(root, transform = train_transform)
+        val_set = torchvision.datasets.ImageFolder(root, transform = val_transform)
+    else:
+        dataset = torchvision.datasets.ImageFolder(root)
+        transform = view_transform(args)
+        train_set = PriorViewDataset(dataset, transform)
+        val_set = PriorViewDataset(dataset, transform, getattr(args, 'prior_view_seed', 41000))
     if args.rep_val_size > len(train_set) - args.rep_batch:
         raise ValueError('The alignment holdout leaves too few training images')
     order = torch.randperm(len(train_set), generator = torch.Generator().manual_seed(args.rep_split_seed)).tolist()
@@ -354,12 +373,35 @@ def prior_log(values):
         wandb.log(values)
 
 def prior_batch(args, teacher, student, images, student_indices, teacher_indices):
+    if getattr(args, 'prior_view_mode', 'single') != 'single':
+        return prior_view_batch(args, teacher, student, images, student_indices, teacher_indices)
     with torch.autocast(device_type = images.device.type, dtype = torch.bfloat16, enabled = args.use_amp and images.device.type == 'cuda'):
         with torch.no_grad():
             targets = prior_forward(teacher, images, teacher_indices, args.pool_hw, getattr(args, 'prior_descriptor', 'pooled'))
         features = prior_forward(student, images, student_indices, args.pool_hw, getattr(args, 'prior_descriptor', 'pooled'))
     losses = [prior_metric(x, y, args) for x, y in zip(features, targets)]
     return torch.stack(losses).mean(), losses, features, targets
+
+def prior_view_batch(args, teacher, student, images, student_indices, teacher_indices):
+    if not isinstance(images, (tuple, list)) or len(images) != 2 or images[0].shape != images[1].shape:
+        raise ValueError('Two-view alignment requires two image batches with identical shapes')
+    if getattr(args, 'prior_descriptor', 'pooled') != 'spatial_only':
+        raise ValueError('Two-view alignment requires the spatial_only descriptor')
+    with torch.autocast(device_type = images[0].device.type, dtype = torch.bfloat16,
+                        enabled = args.use_amp and images[0].device.type == 'cuda'):
+        with torch.no_grad():
+            target_views = [prior_forward(teacher, x, teacher_indices, args.pool_hw, 'spatial_only') for x in images]
+        student_views = [prior_forward(student, x, student_indices, args.pool_hw, 'spatial_only') for x in images]
+    features = [[student_views[v][i][0] for v in range(2)] for i in range(len(student_indices))]
+    targets = [[target_views[v][i][0] for v in range(2)] for i in range(len(teacher_indices))]
+    losses = [view_loss(x, y, args) for x, y in zip(features, targets)]
+    return torch.stack(losses).mean(), losses, features, targets
+
+def prior_view_geometry(features, targets, args):
+    rows = [prior_geometry([x], [y], args.knn_k) for x, y in zip(features, targets)]
+    metrics = {name: sum(row[name] for row in rows) / 2 for name in rows[0]}
+    metrics.update(view_diagnostics(features, targets, args))
+    return metrics
 
 def prior_evaluate(args, teacher, student, loader, student_index, teacher_index, device):
     student_indices, teacher_indices = prior_endpoints(teacher, student, student_index, args.prior_schedule, getattr(args, 'prior_start_stage', 1))
@@ -369,19 +411,19 @@ def prior_evaluate(args, teacher, student, loader, student_index, teacher_index,
     count = 0
     with torch.random.fork_rng(devices = []), prior_mode(teacher, args.prior_norm), prior_mode(student, args.prior_norm), torch.no_grad():
         for images, _ in loader:
-            images = images.to(device, non_blocking = True)
+            images = view_images(images, device)
             loss, losses, features, targets = prior_batch(args, teacher, student, images, student_indices, teacher_indices)
             metrics = {'loss': loss.item()}
             for index, endpoint_loss, x, y in zip(student_indices, losses, features, targets):
-                geometry = prior_geometry(x, y, args.knn_k)
+                geometry = prior_geometry(x, y, args.knn_k) if getattr(args, 'prior_view_mode', 'single') == 'single' else prior_view_geometry(x, y, args)
                 geometry['loss'] = endpoint_loss.item()
                 for name, value in geometry.items():
                     metrics[f'endpoint{index + 1}_{name}'] = value
                     if name != 'loss':
                         metrics[name] = metrics.get(name, 0.0) + value / len(student_indices)
             for name, value in metrics.items():
-                sums[name] = sums.get(name, 0.0) + value * images.size(0)
-            count += images.size(0)
+                sums[name] = sums.get(name, 0.0) + value * view_batch_size(images)
+            count += view_batch_size(images)
     if not count:
         raise ValueError('The alignment validation loader is empty')
     metrics = {name: value / count for name, value in sums.items()}
@@ -493,7 +535,7 @@ def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, d
             except StopIteration:
                 iterator = iter(train_loader)
                 images, _ = next(iterator)
-            images = images.to(device, non_blocking = True)
+            images = view_images(images, device)
             if args.rep_scheduler:
                 factor = prior_lr_factor(step, schedule_steps)
                 for group in optimizer.param_groups:
@@ -554,6 +596,10 @@ def align_prior_stage(args, teacher, student, train_loader, val_loader, stage, d
                'parameter_changes_by_segment': segment_changes, 'lower_prefix_unchanged': lower_unchanged,
                'best_step': best_step, 'accepted': accepted, 'relative_parameter_change': math.sqrt(delta / max(norm, 1e-12)),
                'initial': initial_metrics, 'best_unmixed': best_metrics, 'final': final_metrics, 'history': history}
+    if getattr(args, 'prior_view_mode', 'single') != 'single':
+        summary.update({'prior_view_mode': args.prior_view_mode, 'views_per_image': 2,
+                        'training_image_presentations': steps * args.rep_batch * 2,
+                        'gradient_steps': steps, 'batch_size_per_view': args.rep_batch})
     if getattr(args, 'prior_log_gradients', False):
         summary.update({'schedule_steps': schedule_steps, 'gradient_history': gradient_history,
                         'parameter_changes_by_type': prior_parameter_diagnostics(student, initial)})
@@ -590,6 +636,13 @@ def initialize_optimization_prior(args, teacher, device, initialize_only = False
         return student
     seed_prior(args.seed + 10000)
     train_loader, val_loader, indices = make_prior_loaders(args)
+    if getattr(args, 'prior_view_mode', 'single') != 'single':
+        metadata['view_spec'] = view_spec(args)
+        metadata['selection_metric'] = 'held-out two-view mean active-endpoint representation loss'
+        metadata['view_notes'] = ['Views preserve image identity and ordering; no raw feature maps are averaged.',
+                                  'Guide and student forwards use separate per-view batches.',
+                                  'Validation views are fixed by source image index and view index.',
+                                  'Shared targets add augmentation-consistency supervision, not a trained guide.']
     metadata['validation_indices'] = indices
     metadata['validation_source'] = 'held-out ImageNet training images, excluded from alignment updates'
     for stage in prior_schedule(teacher, student, args.prior_schedule, getattr(args, 'prior_start_stage', 1),

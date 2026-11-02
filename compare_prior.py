@@ -29,13 +29,14 @@ TRAINING_KEYS = ['setting', 'imagenet', 'data_dir', 'ft_epochs', 'ft_batch', 'ft
 ALIGNMENT_KEYS = ['repdist', 'cka_loss', 'knn_loss', 'knn_k', 'knn_temp', 'rep_batch', 'rep_val_size',
                   'rep_split_seed', 'rep_val_interval', 'max_stage_steps', 'progressive_lrs', 'progressive_epochs',
                   'rep_wd', 'rep_scheduler', 'pool_hw', 'prior_schedule', 'align_mix', 'prior_min_rank_ratio',
-                  'prior_norm', 'prior_descriptor', 'prior_start_stage', 'prior_update_scope', 'prior_bn_affine', 'prior_final_steps', 'anchor_to_init', 'anchor_lambda']
+                  'prior_norm', 'prior_descriptor', 'prior_start_stage', 'prior_update_scope', 'prior_bn_affine', 'prior_final_steps', 'prior_view_mode', 'prior_view_crop_min', 'prior_view_seed', 'anchor_to_init', 'anchor_lambda']
 METRICS = ['loss', 'cka', 'ucka', 'knn_overlap', 'student_rank', 'teacher_rank', 'student_centered_rms', 'teacher_centered_rms']
 SOURCE_FILES = ['args.py', 'run_prior.py', 'theseus.py', 'prior_utils.py', 'rep_sims.py', 'finetune.py',
                 'dataloader.py', 'vits.py', 'slurm_scripts/run_prior_array.py', 'compare_prior.py',
                 'audit_prior_geometry.py', 'restart_prior_baseline.py', 'slurm_scripts/run_prior_audit.py',
                 'slurm_scripts/prior_e_upper.sbatch', 'slurm_scripts/prior_f_bn_dose.sbatch',
-                'audit_prior_mechanism.py', 'slurm_scripts/run_prior_mechanism.py', 'slurm_scripts/prior_mechanism_audit.sbatch']
+                'audit_prior_mechanism.py', 'slurm_scripts/run_prior_mechanism.py', 'slurm_scripts/prior_mechanism_audit.sbatch', 'prior_views.py', 'audit_prior_views.py',
+                'slurm_scripts/run_prior_view_audit.py', 'slurm_scripts/prior_view_audit.sbatch', 'slurm_scripts/prior_g_views.sbatch']
 VITS = {'vit_tiny': (192, 4), 'vit_small': (384, 8), 'vit_base': (768, 12), 'vit_large': (1024, 24)}
 SECRET_KEYS = {'api_key', 'wandb_api_key', 'hf_token', 'access_token', 'auth_token', 'password', 'secret', 'token'}
 
@@ -210,7 +211,8 @@ def load_run(root, folder):
         issue(run, 'alignment_no_op', 'The retained initialization has the same recorded state hash as the random student')
     alignment = meta.get('alignment_config', {})
     mismatches = [key for key, value in alignment.items() if key in config and config[key] != value]
-    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix'), ('prior_bn_affine', 'train'), ('prior_final_steps', None)]:
+    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix'), ('prior_bn_affine', 'train'), ('prior_final_steps', None),
+                         ('prior_view_mode', 'single'), ('prior_view_crop_min', 0.5), ('prior_view_seed', 41000)]:
         if alignment.get(key, default) != config.get(key, default) and key not in mismatches:
             mismatches.append(key)
     if not alignment or mismatches:
@@ -248,7 +250,8 @@ def load_run(root, folder):
     run['recipe_id'] = digest(clean(recipe))
     controls = {key: alignment.get(key, config.get(key)) for key in ALIGNMENT_KEYS}
     controls['prior_descriptor'] = alignment.get('prior_descriptor', config.get('prior_descriptor', 'pooled'))
-    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix'), ('prior_bn_affine', 'train'), ('prior_final_steps', None)]:
+    for key, default in [('prior_start_stage', 1), ('prior_update_scope', 'prefix'), ('prior_bn_affine', 'train'), ('prior_final_steps', None),
+                         ('prior_view_mode', 'single'), ('prior_view_crop_min', 0.5), ('prior_view_seed', 41000)]:
         controls[key] = alignment.get(key, config.get(key, default))
     controls['validation_indices_hash'] = digest(meta['validation_indices']) if isinstance(meta.get('validation_indices'), list) else None
     run['alignment_controls'] = controls
@@ -372,12 +375,60 @@ def condition_summary(runs):
                        'prior_update_scope': first['alignment_controls']['prior_update_scope'],
                        'prior_bn_affine': first['alignment_controls']['prior_bn_affine'],
                        'prior_final_steps': first['alignment_controls']['prior_final_steps'],
+                       'prior_view_mode': first['alignment_controls']['prior_view_mode'],
+                       'prior_view_crop_min': first['alignment_controls']['prior_view_crop_min'],
+                       'prior_view_seed': first['alignment_controls']['prior_view_seed'],
                        'steps_per_phase': first['alignment_controls']['max_stage_steps'],
                        'alignment_id': first['alignment_id'], 'student_seeds': sorted(run['seed'] for run in entries),
                        'n_student_seeds': len(entries), 'mean_final_top1': average([run['final_top1'] for run in entries]),
                        'mean_delta_pp': average(values), 'sd_delta_pp': statistics.stdev(values) if len(values) > 1 else None,
                        'min_delta_pp': min(values), 'max_delta_pp': max(values), 'experiments': [run['experiment'] for run in entries]})
     return output
+
+def view_comparisons(runs):
+    groups = defaultdict(lambda: defaultdict(list))
+    for run in runs:
+        controls = run.get('alignment_controls', {})
+        mode = controls.get('prior_view_mode', 'single')
+        if not run['eligible'] or mode not in ['separate', 'shared']:
+            continue
+        match = {name: value for name, value in controls.items() if name != 'prior_view_mode'}
+        meta = run['metadata']
+        key = digest({'recipe': run['recipe_id'], 'method': run['method'], 'guide': run['guide'],
+                      'guide_depth': run['guide_depth'], 'student_seed': run['seed'], 'guide_seed': run['guide_seed'],
+                      'student_hash': meta.get('student_initial_hash'), 'guide_hash': meta.get('guide_initial_hash'),
+                      'alignment': match})
+        groups[key][mode].append(run)
+    rows = []
+    for key, modes in groups.items():
+        if len(modes['separate']) != 1 or len(modes['shared']) != 1:
+            continue
+        separate, shared = modes['separate'][0], modes['shared'][0]
+        rows.append({'comparison_id': key, 'method': shared['method'], 'student_seed': shared['seed'],
+                     'guide_seed': shared['guide_seed'], 'epochs': shared['epochs'],
+                     'separate_experiment': separate['experiment'], 'shared_experiment': shared['experiment'],
+                     'separate_final_top1': separate['final_top1'], 'shared_final_top1': shared['final_top1'],
+                     'shared_minus_separate_pp': shared['final_top1'] - separate['final_top1'],
+                     'same_recorded_two_view_recipe': True})
+    return rows
+
+def view_audit_table(root, runs):
+    rows = []
+    for run in runs:
+        path = root / 'view_audit' / (run['experiment'] + '.json')
+        if not path.is_file():
+            continue
+        report = read_json(path)
+        if report.get('experiment') != run['experiment']:
+            raise ValueError('View audit experiment mismatch: ' + str(path))
+        expected = run['metadata'].get('student_aligned_hash')
+        measured = report.get('state_hashes', {}).get('aligned_student')
+        if measured and expected and measured != expected:
+            raise ValueError('View audit checkpoint fingerprint mismatch: ' + str(path))
+        for row in report.get('rows', []):
+            rows.append({'experiment': run['experiment'], 'method': run['method'],
+                         'prior_view_mode': run['metadata'].get('alignment_config', {}).get('prior_view_mode', 'single'), **row})
+    return rows
 
 def depth_comparisons(runs):
     groups = defaultdict(list)
@@ -412,7 +463,7 @@ def slurm_observations(root, runs):
             with source.open(errors = 'replace') as handle:
                 for line in handle:
                     line = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line)
-                    match = re.search(r'Array [BCDEF]\[\d+\]: (.*?), epochs=', line)
+                    match = re.search(r'Array [BCDEFG]\[\d+\]: (.*?), epochs=', line)
                     if match:
                         name = match.group(1)
                     for match in pattern.finditer(line):
@@ -444,6 +495,9 @@ def inventory_row(run, observations):
                 'prior_start_stage': controls.get('prior_start_stage', 1), 'prior_update_scope': controls.get('prior_update_scope', 'prefix'),
                 'steps_per_phase': controls.get('max_stage_steps'), 'prior_bn_affine': controls.get('prior_bn_affine', 'train'),
                 'prior_final_steps': controls.get('prior_final_steps'),
+                'prior_view_mode': controls.get('prior_view_mode', 'single'),
+                'prior_view_crop_min': controls.get('prior_view_crop_min', 0.5),
+                'prior_view_seed': controls.get('prior_view_seed', 41000),
                 'schedule': meta.get('schedule'), 'align_mix': meta.get('align_mix'),
                 'rank_gate_enabled': meta.get('rank_gate_enabled'), 'guide_unchanged': meta.get('guide_unchanged'),
                 'initialization_hash': meta.get('student_initial_hash'), 'aligned_hash': meta.get('student_aligned_hash'),
@@ -518,6 +572,8 @@ def short_label(run):
     affine = controls.get('prior_bn_affine', 'train')
     cap = controls.get('prior_final_steps')
     suffix = '' if affine == 'train' and cap is None else f' / BN={affine} stop={cap}'
+    if controls.get('prior_view_mode', 'single') != 'single':
+        suffix += ' / views=' + controls['prior_view_mode']
     return f'{method} / {guide} / {descriptor} / from{start} {scope} / {steps} steps / s{seed} g{guide_seed} / {schedule} a={mix}' + suffix
 
 def figure(title, xlabel, ylabel, size = (9, 5)):
@@ -652,7 +708,7 @@ def report_text(runs, inventory, summary, depths, issues, plot_paths):
                        ('last_observed_position', 'Last position'), ('observed_axis', 'Axis'), ('last_observed_top1', 'Observed top-1'),
                        ('log_error_observed', 'Error in latest log')]), '', 'These are not final results and do not enter paired gains.', '']
     lines += [markdown_table(summary, [('student', 'Student'), ('method', 'Method'), ('guide', 'Guide'), ('guide_depth', 'Depth'),
-                                      ('prior_descriptor', 'Descriptor'), ('prior_start_stage', 'First stage'),
+                                      ('prior_descriptor', 'Descriptor'), ('prior_view_mode', 'View target'), ('prior_start_stage', 'First stage'),
                                       ('prior_update_scope', 'Update scope'), ('steps_per_phase', 'Schedule/phase'),
                                       ('prior_final_steps', 'Final cap'), ('prior_bn_affine', 'BN affine'),
                                       ('guide_seed', 'Guide seed'), ('epochs', 'Epochs'), ('n_student_seeds', 'Student seeds'),
@@ -713,7 +769,7 @@ def bundle_results(root, output, runs, artifacts, observations, include_code, in
                     archive.writestr('code/' + name, text_redact(path.read_text()))
         if include_geometry:
             for run in runs:
-                for directory in ['geometry_audit', 'mechanism_audit']:
+                for directory in ['geometry_audit', 'mechanism_audit', 'view_audit']:
                     path = root / directory / (run['experiment'] + '.json')
                     if path.is_file():
                         geometry = read_json(path)
@@ -746,11 +802,13 @@ def analyze(args):
     match_baselines(runs)
     stages, endpoints, history = stage_tables(runs)
     summary, depths = condition_summary(runs), depth_comparisons(runs)
+    view_pairs, view_metrics = view_comparisons(runs), view_audit_table(root, runs)
     observations = slurm_observations(root, runs) if args.include_slurm else []
     inventory = [inventory_row(run, observations) for run in runs]
     issues = [item for run in runs for item in run['issues']]
     tables = {'runs.csv': inventory, 'paired_comparisons.csv': [row for row in inventory if row['pair_status'] == 'matched'],
-              'condition_summary.csv': summary, 'depth_comparisons.csv': depths, 'alignment_stages.csv': stages,
+              'condition_summary.csv': summary, 'depth_comparisons.csv': depths, 'view_comparisons.csv': view_pairs,
+              'view_audit.csv': view_metrics, 'alignment_stages.csv': stages,
               'alignment_endpoints.csv': endpoints, 'alignment_history.csv': history, 'learning_curves.csv': curve_rows(runs),
               'progress.csv': progress_rows(runs, observations), 'warnings.csv': issues}
     artifacts = []
@@ -768,14 +826,19 @@ def analyze(args):
             path.unlink()
     provenance = {'recipes': {run['recipe_id']: run['recipe'] for run in runs if run['recipe_id']},
                   'alignment_settings': {run['alignment_id']: run['alignment_controls'] for run in runs if run.get('alignment_id')},
-                  'runs': inventory, 'summaries': summary, 'depth_comparisons': depths, 'issues': issues,
+                  'runs': inventory, 'summaries': summary, 'depth_comparisons': depths, 'view_comparisons': view_pairs, 'issues': issues,
                   'checkpoints': {run['experiment']: run['checkpoints'] for run in runs}}
     for name, value in [('comparison.json', provenance), ('slurm_observations.json', {'attempts': observations})]:
         path = output / name
         write_json(path, value)
         artifacts.append(path)
     report = output / 'report.md'
-    report.write_text(report_text(runs, inventory, summary, depths, issues, plot_paths))
+    report_body = report_text(runs, inventory, summary, depths, issues, plot_paths)
+    if view_pairs:
+        report_body += '\n## Shared versus separate two-view targets\n\n' + markdown_table(view_pairs,
+                       [('method', 'Loss'), ('student_seed', 'Student seed'), ('separate_final_top1', 'Separate final top-1'),
+                        ('shared_final_top1', 'Shared final top-1'), ('shared_minus_separate_pp', 'Shared minus separate, pp')]) + '\n'
+    report.write_text(report_body)
     artifacts.append(report)
     artifact_list = output / 'generated_files.json'
     write_json(artifact_list, {'files': [str(path.relative_to(output)) for path in artifacts]})

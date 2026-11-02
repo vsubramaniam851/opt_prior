@@ -29,7 +29,10 @@ def get_run_args():
     parser.add_argument('--prior_log_gradients', action = 'store_true')
     parser.add_argument('--prior_min_rank_ratio', type = float, default = 0.0)
     parser.add_argument('--prior_norm', choices = ['batch', 'eval'], default = 'batch')
-    parser.add_argument('--prior_descriptor', choices = ['pooled', 'spatial'], default = 'pooled')
+    parser.add_argument('--prior_descriptor', choices = ['pooled', 'spatial', 'spatial_only'], default = 'pooled')
+    parser.add_argument('--prior_view_mode', choices = ['single', 'separate', 'shared'], default = 'single')
+    parser.add_argument('--prior_view_crop_min', type = float, default = 0.5)
+    parser.add_argument('--prior_view_seed', type = int, default = 41000)
     parser.add_argument('--epochs', type = int, default = None)
     parser.add_argument('--workers', type = int, default = 8)
     parser.add_argument('--exp_name', default = None)
@@ -45,6 +48,13 @@ def build_command(args):
         raise ValueError('The guide must match the family; --depth is only available for ViTs')
     if not resnet and args.depth is not None and args.depth < 4:
         raise ValueError('The ViT guide must have at least four blocks')
+    view_mode = getattr(args, 'prior_view_mode', 'single')
+    crop_min = getattr(args, 'prior_view_crop_min', 0.5)
+    view_seed = getattr(args, 'prior_view_seed', 41000)
+    if not 0 < crop_min <= 1 or view_seed < 0:
+        raise ValueError('Invalid two-view crop scale or validation seed')
+    if view_mode != 'single' and (args.method == 'baseline' or args.prior_descriptor != 'spatial_only'):
+        raise ValueError('Two-view alignment requires a non-baseline run and --prior_descriptor spatial_only')
     start = getattr(args, 'prior_start_stage', 1)
     scope = getattr(args, 'prior_update_scope', 'prefix')
     if not 1 <= start <= 4 or scope not in ['prefix', 'suffix']:
@@ -78,7 +88,7 @@ def build_command(args):
     if args.amp:
         name += '_bf16'
     if args.prior_descriptor != 'pooled' and args.method != 'baseline':
-        name += '_spatial'
+        name += '_' + args.prior_descriptor
     if start != 1:
         name += f'_from{start}'
     if scope != 'prefix':
@@ -87,6 +97,8 @@ def build_command(args):
         name += '_bnfixed'
     if cap is not None:
         name += f'_stop{cap}'
+    if view_mode != 'single':
+        name += f'_views{view_mode}_crop{crop_min:g}_vs{view_seed}'
     name = args.exp_name or name
     method = 'CKA' if args.method == 'baseline' else args.method
     epochs = args.epochs if args.epochs is not None else (100 if resnet else 300)
@@ -108,6 +120,8 @@ def build_command(args):
                '--warmup_epochs', '5' if resnet else '20']
     if args.prior_descriptor != 'pooled':
         command += ['--prior_descriptor', args.prior_descriptor]
+    if view_mode != 'single':
+        command += ['--prior_view_mode', view_mode, '--prior_view_crop_min', str(crop_min), '--prior_view_seed', str(view_seed)]
     if start != 1:
         command += ['--prior_start_stage', str(start)]
     if scope != 'prefix':

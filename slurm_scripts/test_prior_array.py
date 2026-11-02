@@ -30,6 +30,10 @@ def write_initialization(root, run, source = False, align_only = True):
     name = run['source'] if source else run['name']
     folder = root / 'logs' / name
     config = {key: run['training'].get(key) for key in CONFIG_KEYS}
+    for key, default in [('prior_descriptor', 'pooled'), ('prior_view_mode', 'single'),
+                         ('prior_view_crop_min', 0.5), ('prior_view_seed', 41000)]:
+        if run['training'].get(key, default) != default:
+            config[key] = run['training'][key]
     write_json(folder / 'prior_alignment.json', {'version': 2, 'complete': True, 'guide_unchanged': True,
                                                'student_aligned_hash': 'synthetic-fingerprint', 'alignment_config': config})
     write_json(folder / 'args.json', dict(run['training'], exp_name = name, align_only = align_only))
